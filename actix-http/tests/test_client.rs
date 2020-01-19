@@ -3,7 +3,7 @@ use bytes::Bytes;
 use futures::future::{self, ok};
 
 use actix_http::{http, HttpService, Request, Response};
-use actix_http_test::TestServer;
+use actix_http_test::test_server;
 
 const STR: &str = "Hello World Hello World Hello World Hello World Hello World \
                    Hello World Hello World Hello World Hello World Hello World \
@@ -29,8 +29,10 @@ const STR: &str = "Hello World Hello World Hello World Hello World Hello World \
 
 #[actix_rt::test]
 async fn test_h1_v2() {
-    let srv = TestServer::start(move || {
-        HttpService::build().finish(|_| future::ok::<_, ()>(Response::Ok().body(STR)))
+    let srv = test_server(move || {
+        HttpService::build()
+            .finish(|_| future::ok::<_, ()>(Response::Ok().body(STR)))
+            .tcp()
     });
 
     let response = srv.get("/").send().await.unwrap();
@@ -54,9 +56,10 @@ async fn test_h1_v2() {
 
 #[actix_rt::test]
 async fn test_connection_close() {
-    let srv = TestServer::start(move || {
+    let srv = test_server(move || {
         HttpService::build()
             .finish(|_| ok::<_, ()>(Response::Ok().body(STR)))
+            .tcp()
             .map(|_| ())
     });
 
@@ -66,7 +69,7 @@ async fn test_connection_close() {
 
 #[actix_rt::test]
 async fn test_with_query_parameter() {
-    let srv = TestServer::start(move || {
+    let srv = test_server(move || {
         HttpService::build()
             .finish(|req: Request| {
                 if req.uri().query().unwrap().contains("qp=") {
@@ -75,6 +78,7 @@ async fn test_with_query_parameter() {
                     ok::<_, ()>(Response::BadRequest().finish())
                 }
             })
+            .tcp()
             .map(|_| ())
     });
 

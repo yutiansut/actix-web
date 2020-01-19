@@ -69,9 +69,9 @@ impl ServiceFactory for Route {
     type Service = RouteService;
     type Future = CreateRouteService;
 
-    fn new_service(&self, _: &()) -> Self::Future {
+    fn new_service(&self, _: ()) -> Self::Future {
         CreateRouteService {
-            fut: self.service.new_service(&()),
+            fut: self.service.new_service(()),
             guards: self.guards.clone(),
         }
     }
@@ -92,7 +92,7 @@ pub struct CreateRouteService {
 impl Future for CreateRouteService {
     type Output = Result<RouteService, ()>;
 
-    fn poll(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Self::Output> {
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.project();
 
         match this.fut.poll(cx)? {
@@ -127,7 +127,7 @@ impl Service for RouteService {
     type Error = Error;
     type Future = LocalBoxFuture<'static, Result<Self::Response, Self::Error>>;
 
-    fn poll_ready(&mut self, cx: &mut Context) -> Poll<Result<(), Self::Error>> {
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         self.service.poll_ready(cx)
     }
 
@@ -280,9 +280,9 @@ where
     type Service = BoxedRouteService<ServiceRequest, Self::Response>;
     type Future = LocalBoxFuture<'static, Result<Self::Service, Self::InitError>>;
 
-    fn new_service(&self, _: &()) -> Self::Future {
+    fn new_service(&self, _: ()) -> Self::Future {
         self.service
-            .new_service(&())
+            .new_service(())
             .map(|result| match result {
                 Ok(service) => {
                     let service: BoxedRouteService<_, _> =
@@ -313,7 +313,7 @@ where
     type Error = Error;
     type Future = LocalBoxFuture<'static, Result<Self::Response, Self::Error>>;
 
-    fn poll_ready(&mut self, cx: &mut Context) -> Poll<Result<(), Self::Error>> {
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         self.service.poll_ready(cx).map_err(|(e, _)| e)
     }
 

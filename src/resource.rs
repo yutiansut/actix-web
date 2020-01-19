@@ -6,6 +6,7 @@ use std::rc::Rc;
 use std::task::{Context, Poll};
 
 use actix_http::{Error, Extensions, Response};
+use actix_router::IntoPattern;
 use actix_service::boxed::{self, BoxService, BoxServiceFactory};
 use actix_service::{
     apply, apply_fn_factory, IntoServiceFactory, Service, ServiceFactory, Transform,
@@ -48,7 +49,7 @@ type HttpNewService = BoxServiceFactory<(), ServiceRequest, ServiceResponse, Err
 /// Default behavior could be overriden with `default_resource()` method.
 pub struct Resource<T = ResourceEndpoint> {
     endpoint: T,
-    rdef: String,
+    rdef: Vec<String>,
     name: Option<String>,
     routes: Vec<Route>,
     data: Option<Extensions>,
@@ -58,12 +59,12 @@ pub struct Resource<T = ResourceEndpoint> {
 }
 
 impl Resource {
-    pub fn new(path: &str) -> Resource {
+    pub fn new<T: IntoPattern>(path: T) -> Resource {
         let fref = Rc::new(RefCell::new(None));
 
         Resource {
             routes: Vec::new(),
-            rdef: path.to_string(),
+            rdef: path.patterns(),
             name: None,
             endpoint: ResourceEndpoint::new(fref.clone()),
             factory_ref: fref,
@@ -192,16 +193,13 @@ where
     /// }
     /// ```
     pub fn data<U: 'static>(self, data: U) -> Self {
-        self.register_data(Data::new(data))
+        self.app_data(Data::new(data))
     }
 
     /// Set or override application data.
     ///
-    /// This method has the same effect as [`Resource::data`](#method.data),
-    /// except that instead of taking a value of some type `T`, it expects a
-    /// value of type `Data<T>`. Use a `Data<T>` extractor to retrieve its
-    /// value.
-    pub fn register_data<U: 'static>(mut self, data: Data<U>) -> Self {
+    /// This method overrides data stored with [`App::app_data()`](#method.app_data)
+    pub fn app_data<U: 'static>(mut self, data: U) -> Self {
         if self.data.is_none() {
             self.data = Some(Extensions::new());
         }
@@ -384,9 +382,9 @@ where
             Some(std::mem::replace(&mut self.guards, Vec::new()))
         };
         let mut rdef = if config.is_root() || !self.rdef.is_empty() {
-            ResourceDef::new(&insert_slash(&self.rdef))
+            ResourceDef::new(insert_slash(self.rdef.clone()))
         } else {
-            ResourceDef::new(&self.rdef)
+            ResourceDef::new(self.rdef.clone())
         };
         if let Some(ref name) = self.name {
             *rdef.name_mut() = name.clone();
@@ -435,9 +433,9 @@ impl ServiceFactory for ResourceFactory {
     type Service = ResourceService;
     type Future = CreateResourceService;
 
-    fn new_service(&self, _: &()) -> Self::Future {
+    fn new_service(&self, _: ()) -> Self::Future {
         let default_fut = if let Some(ref default) = *self.default.borrow() {
-            Some(default.new_service(&()))
+            Some(default.new_service(()))
         } else {
             None
         };
@@ -446,7 +444,7 @@ impl ServiceFactory for ResourceFactory {
             fut: self
                 .routes
                 .iter()
-                .map(|route| CreateRouteServiceItem::Future(route.new_service(&())))
+                .map(|route| CreateRouteServiceItem::Future(route.new_service(())))
                 .collect(),
             data: self.data.clone(),
             default: None,
@@ -470,7 +468,7 @@ pub struct CreateResourceService {
 impl Future for CreateResourceService {
     type Output = Result<ResourceService, ()>;
 
-    fn poll(mut self: Pin<&mut Self>, cx: &mut Context) -> Poll<Self::Output> {
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let mut done = true;
 
         if let Some(ref mut fut) = self.default_fut {
@@ -530,7 +528,7 @@ impl Service for ResourceService {
         LocalBoxFuture<'static, Result<ServiceResponse, Error>>,
     >;
 
-    fn poll_ready(&mut self, _: &mut Context) -> Poll<Result<(), Self::Error>> {
+    fn poll_ready(&mut self, _: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         Poll::Ready(Ok(()))
     }
 
@@ -575,8 +573,8 @@ impl ServiceFactory for ResourceEndpoint {
     type Service = ResourceService;
     type Future = CreateResourceService;
 
-    fn new_service(&self, _: &()) -> Self::Future {
-        self.factory.borrow_mut().as_mut().unwrap().new_service(&())
+    fn new_service(&self, _: ()) -> Self::Future {
+        self.factory.borrow_mut().as_mut().unwrap().new_service(())
     }
 }
 
@@ -659,6 +657,23 @@ mod tests {
             })))
             .await;
         let req = TestRequest::with_uri("/test").to_request();
+        let resp = call_service(&mut srv, req).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[actix_rt::test]
+    async fn test_pattern() {
+        let mut srv = init_service(
+            App::new().service(
+                web::resource(["/test", "/test2"])
+                    .to(|| async { Ok::<_, Error>(HttpResponse::Ok()) }),
+            ),
+        )
+        .await;
+        let req = TestRequest::with_uri("/test").to_request();
+        let resp = call_service(&mut srv, req).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let req = TestRequest::with_uri("/test2").to_request();
         let resp = call_service(&mut srv, req).await;
         assert_eq!(resp.status(), StatusCode::OK);
     }
@@ -754,19 +769,19 @@ mod tests {
             App::new()
                 .data(1.0f64)
                 .data(1usize)
-                .register_data(web::Data::new('-'))
+                .app_data(web::Data::new('-'))
                 .service(
                     web::resource("/test")
                         .data(10usize)
-                        .register_data(web::Data::new('*'))
+                        .app_data(web::Data::new('*'))
                         .guard(guard::Get())
                         .to(
                             |data1: web::Data<usize>,
                              data2: web::Data<char>,
                              data3: web::Data<f64>| {
-                                assert_eq!(*data1, 10);
-                                assert_eq!(*data2, '*');
-                                assert_eq!(*data3, 1.0);
+                                assert_eq!(**data1, 10);
+                                assert_eq!(**data2, '*');
+                                assert_eq!(**data3, 1.0);
                                 HttpResponse::Ok()
                             },
                         ),

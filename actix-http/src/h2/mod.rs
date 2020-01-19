@@ -1,11 +1,9 @@
-#![allow(dead_code, unused_imports)]
-use std::fmt;
-use std::future::Future;
+//! HTTP/2 implementation
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
 use bytes::Bytes;
-use futures::Stream;
+use futures_core::Stream;
 use h2::RecvStream;
 
 mod dispatcher;
@@ -29,13 +27,16 @@ impl Payload {
 impl Stream for Payload {
     type Item = Result<Bytes, PayloadError>;
 
-    fn poll_next(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Option<Self::Item>> {
+    fn poll_next(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Self::Item>> {
         let this = self.get_mut();
 
         match Pin::new(&mut this.pl).poll_data(cx) {
             Poll::Ready(Some(Ok(chunk))) => {
                 let len = chunk.len();
-                if let Err(err) = this.pl.release_capacity().release_capacity(len) {
+                if let Err(err) = this.pl.flow_control().release_capacity(len) {
                     Poll::Ready(Some(Err(err.into())))
                 } else {
                     Poll::Ready(Some(Ok(chunk)))

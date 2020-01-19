@@ -6,10 +6,13 @@ use std::str::Utf8Error;
 use std::string::FromUtf8Error;
 use std::{fmt, io, result};
 
+use actix_codec::{Decoder, Encoder};
+pub use actix_threadpool::BlockingError;
+use actix_utils::framed::DispatcherError as FramedDispatcherError;
 use actix_utils::timeout::TimeoutError;
 use bytes::BytesMut;
 use derive_more::{Display, From};
-pub use futures::channel::oneshot::Canceled;
+pub use futures_channel::oneshot::Canceled;
 use http::uri::InvalidUri;
 use http::{header, Error as HttpError, StatusCode};
 use httparse;
@@ -21,7 +24,7 @@ use serde_urlencoded::ser::Error as FormError;
 use crate::body::Body;
 pub use crate::cookie::ParseError as CookieParseError;
 use crate::helpers::Writer;
-use crate::response::Response;
+use crate::response::{Response, ResponseBuilder};
 
 /// A specialized [`Result`](https://doc.rust-lang.org/std/result/enum.Result.html)
 /// for actix web operations
@@ -101,34 +104,30 @@ impl dyn ResponseError + 'static {
 }
 
 impl fmt::Display for Error {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         fmt::Display::fmt(&self.cause, f)
     }
 }
 
 impl fmt::Debug for Error {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        writeln!(f, "{:?}", &self.cause)
-    }
-}
-
-impl From<()> for Error {
-    fn from(_: ()) -> Self {
-        Error::from(UnitError)
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{:?}", &self.cause)
     }
 }
 
 impl std::error::Error for Error {
-    fn description(&self) -> &str {
-        "actix-http::Error"
-    }
-
     fn cause(&self) -> Option<&dyn std::error::Error> {
         None
     }
 
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         None
+    }
+}
+
+impl From<()> for Error {
+    fn from(_: ()) -> Self {
+        Error::from(UnitError)
     }
 }
 
@@ -153,6 +152,20 @@ impl<T: ResponseError + 'static> From<T> for Error {
         Error {
             cause: Box::new(err),
         }
+    }
+}
+
+/// Convert Response to a Error
+impl From<Response> for Error {
+    fn from(res: Response) -> Error {
+        InternalError::from_response("", res).into()
+    }
+}
+
+/// Convert ResponseBuilder to a Error
+impl From<ResponseBuilder> for Error {
+    fn from(mut res: ResponseBuilder) -> Error {
+        InternalError::from_response("", res.finish()).into()
     }
 }
 
@@ -181,11 +194,11 @@ impl ResponseError for FormError {}
 
 #[cfg(feature = "openssl")]
 /// `InternalServerError` for `openssl::ssl::Error`
-impl ResponseError for open_ssl::ssl::Error {}
+impl ResponseError for actix_connect::ssl::openssl::SslError {}
 
 #[cfg(feature = "openssl")]
 /// `InternalServerError` for `openssl::ssl::HandshakeError`
-impl<T: std::fmt::Debug> ResponseError for open_ssl::ssl::HandshakeError<T> {}
+impl<T: std::fmt::Debug> ResponseError for actix_tls::openssl::HandshakeError<T> {}
 
 /// Return `BAD_REQUEST` for `de::value::Error`
 impl ResponseError for DeError {
@@ -196,6 +209,9 @@ impl ResponseError for DeError {
 
 /// `InternalServerError` for `Canceled`
 impl ResponseError for Canceled {}
+
+/// `InternalServerError` for `BlockingError`
+impl<E: fmt::Debug> ResponseError for BlockingError<E> {}
 
 /// Return `BAD_REQUEST` for `Utf8Error`
 impl ResponseError for Utf8Error {
@@ -221,13 +237,6 @@ impl ResponseError for io::Error {
 
 /// `BadRequest` for `InvalidHeaderValue`
 impl ResponseError for header::InvalidHeaderValue {
-    fn status_code(&self) -> StatusCode {
-        StatusCode::BAD_REQUEST
-    }
-}
-
-/// `BadRequest` for `InvalidHeaderValue`
-impl ResponseError for header::InvalidHeaderValueBytes {
     fn status_code(&self) -> StatusCode {
         StatusCode::BAD_REQUEST
     }
@@ -359,12 +368,15 @@ impl From<io::Error> for PayloadError {
     }
 }
 
-impl From<Canceled> for PayloadError {
-    fn from(_: Canceled) -> Self {
-        PayloadError::Io(io::Error::new(
-            io::ErrorKind::Other,
-            "Operation is canceled",
-        ))
+impl From<BlockingError<io::Error>> for PayloadError {
+    fn from(err: BlockingError<io::Error>) -> Self {
+        match err {
+            BlockingError::Error(e) => PayloadError::Io(e),
+            BlockingError::Canceled => PayloadError::Io(io::Error::new(
+                io::ErrorKind::Other,
+                "Operation is canceled",
+            )),
+        }
     }
 }
 
@@ -453,6 +465,14 @@ impl ResponseError for ContentTypeError {
     }
 }
 
+impl<E, U: Encoder + Decoder> ResponseError for FramedDispatcherError<E, U>
+where
+    E: fmt::Debug + fmt::Display,
+    <U as Encoder>::Error: fmt::Debug,
+    <U as Decoder>::Error: fmt::Debug,
+{
+}
+
 /// Helper type that can wrap any error and generate custom response.
 ///
 /// In following example any `io::Error` will be converted into "BAD REQUEST"
@@ -460,14 +480,12 @@ impl ResponseError for ContentTypeError {
 /// default.
 ///
 /// ```rust
-/// # extern crate actix_http;
 /// # use std::io;
 /// # use actix_http::*;
 ///
 /// fn index(req: Request) -> Result<&'static str> {
 ///     Err(error::ErrorBadRequest(io::Error::new(io::ErrorKind::Other, "error")))
 /// }
-/// # fn main() {}
 /// ```
 pub struct InternalError<T> {
     cause: T,
@@ -501,7 +519,7 @@ impl<T> fmt::Debug for InternalError<T>
 where
     T: fmt::Debug + 'static,
 {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         fmt::Debug::fmt(&self.cause, f)
     }
 }
@@ -510,7 +528,7 @@ impl<T> fmt::Display for InternalError<T>
 where
     T: fmt::Display + 'static,
 {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         fmt::Display::fmt(&self.cause, f)
     }
 }
@@ -552,13 +570,6 @@ where
                 }
             }
         }
-    }
-}
-
-/// Convert Response to a Error
-impl From<Response> for Error {
-    fn from(res: Response) -> Error {
-        InternalError::from_response("", res).into()
     }
 }
 
@@ -952,20 +963,15 @@ where
     InternalError::new(err, StatusCode::NETWORK_AUTHENTICATION_REQUIRED).into()
 }
 
-#[cfg(feature = "fail")]
-mod failure_integration {
-    use super::*;
-
-    /// Compatibility for `failure::Error`
-    impl ResponseError for failure::Error {}
-}
+#[cfg(feature = "failure")]
+/// Compatibility for `failure::Error`
+impl ResponseError for fail_ure::Error {}
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use http::{Error as HttpError, StatusCode};
     use httparse;
-    use std::error::Error as StdError;
     use std::io;
 
     #[test]
@@ -994,7 +1000,7 @@ mod tests {
     #[test]
     fn test_error_cause() {
         let orig = io::Error::new(io::ErrorKind::Other, "other");
-        let desc = orig.description().to_owned();
+        let desc = orig.to_string();
         let e = Error::from(orig);
         assert_eq!(format!("{}", e.as_response_error()), desc);
     }
@@ -1002,7 +1008,7 @@ mod tests {
     #[test]
     fn test_error_display() {
         let orig = io::Error::new(io::ErrorKind::Other, "other");
-        let desc = orig.description().to_owned();
+        let desc = orig.to_string();
         let e = Error::from(orig);
         assert_eq!(format!("{}", e), desc);
     }
@@ -1044,7 +1050,7 @@ mod tests {
             match ParseError::from($from) {
                 e @ $error => {
                     let desc = format!("{}", e);
-                    assert_eq!(desc, format!("IO error: {}", $from.description()));
+                    assert_eq!(desc, format!("IO error: {}", $from));
                 }
                 _ => unreachable!("{:?}", $from),
             }

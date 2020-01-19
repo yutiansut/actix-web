@@ -4,12 +4,10 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 
 use actix_threadpool::{run, CpuFuture};
-#[cfg(feature = "brotli")]
 use brotli2::write::BrotliDecoder;
 use bytes::Bytes;
-#[cfg(any(feature = "flate2-zlib", feature = "flate2-rust"))]
 use flate2::write::{GzDecoder, ZlibDecoder};
-use futures::{ready, Stream};
+use futures_core::{ready, Stream};
 
 use super::Writer;
 use crate::error::PayloadError;
@@ -21,7 +19,7 @@ pub struct Decoder<S> {
     decoder: Option<ContentDecoder>,
     stream: S,
     eof: bool,
-    fut: Option<CpuFuture<Result<(Option<Bytes>, ContentDecoder), io::Error>>>,
+    fut: Option<CpuFuture<(Option<Bytes>, ContentDecoder), io::Error>>,
 }
 
 impl<S> Decoder<S>
@@ -32,15 +30,12 @@ where
     #[inline]
     pub fn new(stream: S, encoding: ContentEncoding) -> Decoder<S> {
         let decoder = match encoding {
-            #[cfg(feature = "brotli")]
             ContentEncoding::Br => Some(ContentDecoder::Br(Box::new(
                 BrotliDecoder::new(Writer::new()),
             ))),
-            #[cfg(any(feature = "flate2-zlib", feature = "flate2-rust"))]
             ContentEncoding::Deflate => Some(ContentDecoder::Deflate(Box::new(
                 ZlibDecoder::new(Writer::new()),
             ))),
-            #[cfg(any(feature = "flate2-zlib", feature = "flate2-rust"))]
             ContentEncoding::Gzip => Some(ContentDecoder::Gzip(Box::new(
                 GzDecoder::new(Writer::new()),
             ))),
@@ -80,13 +75,12 @@ where
 
     fn poll_next(
         mut self: Pin<&mut Self>,
-        cx: &mut Context,
+        cx: &mut Context<'_>,
     ) -> Poll<Option<Self::Item>> {
         loop {
             if let Some(ref mut fut) = self.fut {
                 let (chunk, decoder) = match ready!(Pin::new(fut).poll(cx)) {
-                    Ok(Ok(item)) => item,
-                    Ok(Err(e)) => return Poll::Ready(Some(Err(e.into()))),
+                    Ok(item) => item,
                     Err(e) => return Poll::Ready(Some(Err(e.into()))),
                 };
                 self.decoder = Some(decoder);
@@ -141,22 +135,17 @@ where
 }
 
 enum ContentDecoder {
-    #[cfg(any(feature = "flate2-zlib", feature = "flate2-rust"))]
     Deflate(Box<ZlibDecoder<Writer>>),
-    #[cfg(any(feature = "flate2-zlib", feature = "flate2-rust"))]
     Gzip(Box<GzDecoder<Writer>>),
-    #[cfg(feature = "brotli")]
     Br(Box<BrotliDecoder<Writer>>),
 }
 
 impl ContentDecoder {
-    #[allow(unreachable_patterns)]
     fn feed_eof(&mut self) -> io::Result<Option<Bytes>> {
         match self {
-            #[cfg(feature = "brotli")]
-            ContentDecoder::Br(ref mut decoder) => match decoder.finish() {
-                Ok(mut writer) => {
-                    let b = writer.take();
+            ContentDecoder::Br(ref mut decoder) => match decoder.flush() {
+                Ok(()) => {
+                    let b = decoder.get_mut().take();
                     if !b.is_empty() {
                         Ok(Some(b))
                     } else {
@@ -165,7 +154,6 @@ impl ContentDecoder {
                 }
                 Err(e) => Err(e),
             },
-            #[cfg(any(feature = "flate2-zlib", feature = "flate2-rust"))]
             ContentDecoder::Gzip(ref mut decoder) => match decoder.try_finish() {
                 Ok(_) => {
                     let b = decoder.get_mut().take();
@@ -177,7 +165,6 @@ impl ContentDecoder {
                 }
                 Err(e) => Err(e),
             },
-            #[cfg(any(feature = "flate2-zlib", feature = "flate2-rust"))]
             ContentDecoder::Deflate(ref mut decoder) => match decoder.try_finish() {
                 Ok(_) => {
                     let b = decoder.get_mut().take();
@@ -189,14 +176,11 @@ impl ContentDecoder {
                 }
                 Err(e) => Err(e),
             },
-            _ => Ok(None),
         }
     }
 
-    #[allow(unreachable_patterns)]
     fn feed_data(&mut self, data: Bytes) -> io::Result<Option<Bytes>> {
         match self {
-            #[cfg(feature = "brotli")]
             ContentDecoder::Br(ref mut decoder) => match decoder.write_all(&data) {
                 Ok(_) => {
                     decoder.flush()?;
@@ -209,7 +193,6 @@ impl ContentDecoder {
                 }
                 Err(e) => Err(e),
             },
-            #[cfg(any(feature = "flate2-zlib", feature = "flate2-rust"))]
             ContentDecoder::Gzip(ref mut decoder) => match decoder.write_all(&data) {
                 Ok(_) => {
                     decoder.flush()?;
@@ -222,7 +205,6 @@ impl ContentDecoder {
                 }
                 Err(e) => Err(e),
             },
-            #[cfg(any(feature = "flate2-zlib", feature = "flate2-rust"))]
             ContentDecoder::Deflate(ref mut decoder) => match decoder.write_all(&data) {
                 Ok(_) => {
                     decoder.flush()?;
@@ -235,7 +217,6 @@ impl ContentDecoder {
                 }
                 Err(e) => Err(e),
             },
-            _ => Ok(Some(data)),
         }
     }
 }

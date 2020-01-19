@@ -1,16 +1,15 @@
+use std::convert::TryFrom;
 use std::net;
 use std::rc::Rc;
 use std::time::Duration;
 
 use bytes::Bytes;
-use futures::Stream;
+use futures_core::Stream;
 use serde::Serialize;
 
 use actix_http::body::Body;
 use actix_http::http::header::IntoHeaderValue;
-use actix_http::http::{
-    Error as HttpError, HeaderMap, HeaderName, HttpTryFrom, Method, Uri,
-};
+use actix_http::http::{Error as HttpError, HeaderMap, HeaderName, Method, Uri};
 use actix_http::{Error, RequestHead};
 
 use crate::sender::{RequestSender, SendClientRequest};
@@ -112,7 +111,8 @@ impl FrozenClientRequest {
     /// Create a `FrozenSendBuilder` with an extra header
     pub fn extra_header<K, V>(&self, key: K, value: V) -> FrozenSendBuilder
     where
-        HeaderName: HttpTryFrom<K>,
+        HeaderName: TryFrom<K>,
+        <HeaderName as TryFrom<K>>::Error: Into<HttpError>,
         V: IntoHeaderValue,
     {
         self.extra_headers(HeaderMap::new())
@@ -139,7 +139,8 @@ impl FrozenSendBuilder {
     /// Insert a header, it overrides existing header in `FrozenClientRequest`.
     pub fn extra_header<K, V>(mut self, key: K, value: V) -> Self
     where
-        HeaderName: HttpTryFrom<K>,
+        HeaderName: TryFrom<K>,
+        <HeaderName as TryFrom<K>>::Error: Into<HttpError>,
         V: IntoHeaderValue,
     {
         match HeaderName::try_from(key) {

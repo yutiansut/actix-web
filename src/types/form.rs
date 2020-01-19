@@ -14,6 +14,7 @@ use futures::StreamExt;
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 
+#[cfg(feature = "compress")]
 use crate::dev::Decompress;
 use crate::error::UrlencodedError;
 use crate::extract::FromRequest;
@@ -141,13 +142,13 @@ where
 }
 
 impl<T: fmt::Debug> fmt::Debug for Form<T> {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         self.0.fmt(f)
     }
 }
 
 impl<T: fmt::Display> fmt::Display for Form<T> {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         self.0.fmt(f)
     }
 }
@@ -189,7 +190,7 @@ impl<T: Serialize> Responder for Form<T> {
 ///     let app = App::new().service(
 ///         web::resource("/index.html")
 ///             // change `Form` extractor configuration
-///             .data(
+///             .app_data(
 ///                 web::Form::<FormData>::configure(|cfg| cfg.limit(4097))
 ///             )
 ///             .route(web::get().to(index))
@@ -240,7 +241,10 @@ impl Default for FormConfig {
 /// * content-length is greater than 32k
 ///
 pub struct UrlEncoded<U> {
+    #[cfg(feature = "compress")]
     stream: Option<Decompress<Payload>>,
+    #[cfg(not(feature = "compress"))]
+    stream: Option<Payload>,
     limit: usize,
     length: Option<usize>,
     encoding: &'static Encoding,
@@ -273,7 +277,11 @@ impl<U> UrlEncoded<U> {
             }
         };
 
+        #[cfg(feature = "compress")]
         let payload = Decompress::from_headers(payload.take(), req.headers());
+        #[cfg(not(feature = "compress"))]
+        let payload = payload.take();
+
         UrlEncoded {
             encoding,
             stream: Some(payload),
@@ -308,7 +316,7 @@ where
 {
     type Output = Result<U, UrlencodedError>;
 
-    fn poll(mut self: Pin<&mut Self>, cx: &mut Context) -> Poll<Self::Output> {
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         if let Some(ref mut fut) = self.fut {
             return Pin::new(fut).poll(cx);
         }
@@ -357,7 +365,7 @@ where
                         .map_err(|_| UrlencodedError::Parse)
                 }
             }
-                .boxed_local(),
+            .boxed_local(),
         );
         self.poll(cx)
     }

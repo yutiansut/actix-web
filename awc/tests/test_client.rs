@@ -13,11 +13,14 @@ use futures::future::ok;
 use rand::Rng;
 
 use actix_http::HttpService;
-use actix_http_test::TestServer;
-use actix_service::pipeline_factory;
+use actix_http_test::test_server;
+use actix_service::{map_config, pipeline_factory};
+use actix_web::dev::{AppConfig, BodyEncoding};
 use actix_web::http::Cookie;
-use actix_web::middleware::{BodyEncoding, Compress};
-use actix_web::{http::header, web, App, Error, HttpMessage, HttpRequest, HttpResponse};
+use actix_web::middleware::Compress;
+use actix_web::{
+    http::header, test, web, App, Error, HttpMessage, HttpRequest, HttpResponse,
+};
 use awc::error::SendRequestError;
 
 const STR: &str = "Hello World Hello World Hello World Hello World Hello World \
@@ -44,12 +47,10 @@ const STR: &str = "Hello World Hello World Hello World Hello World Hello World \
 
 #[actix_rt::test]
 async fn test_simple() {
-    let srv =
-        TestServer::start(|| {
-            HttpService::new(App::new().service(
-                web::resource("/").route(web::to(|| HttpResponse::Ok().body(STR))),
-            ))
-        });
+    let srv = test::start(|| {
+        App::new()
+            .service(web::resource("/").route(web::to(|| HttpResponse::Ok().body(STR))))
+    });
 
     let request = srv.get("/").header("x-test", "111").send();
     let mut response = request.await.unwrap();
@@ -73,10 +74,10 @@ async fn test_simple() {
 
 #[actix_rt::test]
 async fn test_json() {
-    let srv = TestServer::start(|| {
-        HttpService::new(App::new().service(
+    let srv = test::start(|| {
+        App::new().service(
             web::resource("/").route(web::to(|_: web::Json<String>| HttpResponse::Ok())),
-        ))
+        )
     });
 
     let request = srv
@@ -89,10 +90,10 @@ async fn test_json() {
 
 #[actix_rt::test]
 async fn test_form() {
-    let srv = TestServer::start(|| {
-        HttpService::new(App::new().service(web::resource("/").route(web::to(
+    let srv = test::start(|| {
+        App::new().service(web::resource("/").route(web::to(
             |_: web::Form<HashMap<String, String>>| HttpResponse::Ok(),
-        ))))
+        )))
     });
 
     let mut data = HashMap::new();
@@ -105,13 +106,13 @@ async fn test_form() {
 
 #[actix_rt::test]
 async fn test_timeout() {
-    let srv = TestServer::start(|| {
-        HttpService::new(App::new().service(web::resource("/").route(web::to(|| {
+    let srv = test::start(|| {
+        App::new().service(web::resource("/").route(web::to(|| {
             async {
                 actix_rt::time::delay_for(Duration::from_millis(200)).await;
                 Ok::<_, Error>(HttpResponse::Ok().body(STR))
             }
-        }))))
+        })))
     });
 
     let connector = awc::Connector::new()
@@ -135,13 +136,13 @@ async fn test_timeout() {
 
 #[actix_rt::test]
 async fn test_timeout_override() {
-    let srv = TestServer::start(|| {
-        HttpService::new(App::new().service(web::resource("/").route(web::to(|| {
+    let srv = test::start(|| {
+        App::new().service(web::resource("/").route(web::to(|| {
             async {
                 actix_rt::time::delay_for(Duration::from_millis(200)).await;
                 Ok::<_, Error>(HttpResponse::Ok().body(STR))
             }
-        }))))
+        })))
     });
 
     let client = awc::Client::build()
@@ -162,15 +163,20 @@ async fn test_connection_reuse() {
     let num = Arc::new(AtomicUsize::new(0));
     let num2 = num.clone();
 
-    let srv = TestServer::start(move || {
+    let srv = test_server(move || {
         let num2 = num2.clone();
         pipeline_factory(move |io| {
             num2.fetch_add(1, Ordering::Relaxed);
             ok(io)
         })
-        .and_then(HttpService::new(
-            App::new().service(web::resource("/").route(web::to(|| HttpResponse::Ok()))),
-        ))
+        .and_then(
+            HttpService::new(map_config(
+                App::new()
+                    .service(web::resource("/").route(web::to(|| HttpResponse::Ok()))),
+                |_| AppConfig::default(),
+            ))
+            .tcp(),
+        )
     });
 
     let client = awc::Client::default();
@@ -194,15 +200,20 @@ async fn test_connection_force_close() {
     let num = Arc::new(AtomicUsize::new(0));
     let num2 = num.clone();
 
-    let srv = TestServer::start(move || {
+    let srv = test_server(move || {
         let num2 = num2.clone();
         pipeline_factory(move |io| {
             num2.fetch_add(1, Ordering::Relaxed);
             ok(io)
         })
-        .and_then(HttpService::new(
-            App::new().service(web::resource("/").route(web::to(|| HttpResponse::Ok()))),
-        ))
+        .and_then(
+            HttpService::new(map_config(
+                App::new()
+                    .service(web::resource("/").route(web::to(|| HttpResponse::Ok()))),
+                |_| AppConfig::default(),
+            ))
+            .tcp(),
+        )
     });
 
     let client = awc::Client::default();
@@ -226,18 +237,22 @@ async fn test_connection_server_close() {
     let num = Arc::new(AtomicUsize::new(0));
     let num2 = num.clone();
 
-    let srv = TestServer::start(move || {
+    let srv = test_server(move || {
         let num2 = num2.clone();
         pipeline_factory(move |io| {
             num2.fetch_add(1, Ordering::Relaxed);
             ok(io)
         })
-        .and_then(HttpService::new(
-            App::new().service(
-                web::resource("/")
-                    .route(web::to(|| HttpResponse::Ok().force_close().finish())),
-            ),
-        ))
+        .and_then(
+            HttpService::new(map_config(
+                App::new().service(
+                    web::resource("/")
+                        .route(web::to(|| HttpResponse::Ok().force_close().finish())),
+                ),
+                |_| AppConfig::default(),
+            ))
+            .tcp(),
+        )
     });
 
     let client = awc::Client::default();
@@ -261,15 +276,21 @@ async fn test_connection_wait_queue() {
     let num = Arc::new(AtomicUsize::new(0));
     let num2 = num.clone();
 
-    let srv = TestServer::start(move || {
+    let srv = test_server(move || {
         let num2 = num2.clone();
         pipeline_factory(move |io| {
             num2.fetch_add(1, Ordering::Relaxed);
             ok(io)
         })
-        .and_then(HttpService::new(App::new().service(
-            web::resource("/").route(web::to(|| HttpResponse::Ok().body(STR))),
-        )))
+        .and_then(
+            HttpService::new(map_config(
+                App::new().service(
+                    web::resource("/").route(web::to(|| HttpResponse::Ok().body(STR))),
+                ),
+                |_| AppConfig::default(),
+            ))
+            .tcp(),
+        )
     });
 
     let client = awc::Client::build()
@@ -302,18 +323,22 @@ async fn test_connection_wait_queue_force_close() {
     let num = Arc::new(AtomicUsize::new(0));
     let num2 = num.clone();
 
-    let srv = TestServer::start(move || {
+    let srv = test_server(move || {
         let num2 = num2.clone();
         pipeline_factory(move |io| {
             num2.fetch_add(1, Ordering::Relaxed);
             ok(io)
         })
-        .and_then(HttpService::new(
-            App::new().service(
-                web::resource("/")
-                    .route(web::to(|| HttpResponse::Ok().force_close().body(STR))),
-            ),
-        ))
+        .and_then(
+            HttpService::new(map_config(
+                App::new().service(
+                    web::resource("/")
+                        .route(web::to(|| HttpResponse::Ok().force_close().body(STR))),
+                ),
+                |_| AppConfig::default(),
+            ))
+            .tcp(),
+        )
     });
 
     let client = awc::Client::build()
@@ -343,16 +368,14 @@ async fn test_connection_wait_queue_force_close() {
 
 #[actix_rt::test]
 async fn test_with_query_parameter() {
-    let srv = TestServer::start(|| {
-        HttpService::new(App::new().service(web::resource("/").to(
-            |req: HttpRequest| {
-                if req.query_string().contains("qp") {
-                    HttpResponse::Ok()
-                } else {
-                    HttpResponse::BadRequest()
-                }
-            },
-        )))
+    let srv = test::start(|| {
+        App::new().service(web::resource("/").to(|req: HttpRequest| {
+            if req.query_string().contains("qp") {
+                HttpResponse::Ok()
+            } else {
+                HttpResponse::BadRequest()
+            }
+        }))
     });
 
     let res = awc::Client::new()
@@ -365,14 +388,14 @@ async fn test_with_query_parameter() {
 
 #[actix_rt::test]
 async fn test_no_decompress() {
-    let srv = TestServer::start(|| {
-        HttpService::new(App::new().wrap(Compress::default()).service(
-            web::resource("/").route(web::to(|| {
+    let srv = test::start(|| {
+        App::new()
+            .wrap(Compress::default())
+            .service(web::resource("/").route(web::to(|| {
                 let mut res = HttpResponse::Ok().body(STR);
                 res.encoding(header::ContentEncoding::Gzip);
                 res
-            })),
-        ))
+            })))
     });
 
     let mut res = awc::Client::new()
@@ -409,8 +432,8 @@ async fn test_no_decompress() {
 
 #[actix_rt::test]
 async fn test_client_gzip_encoding() {
-    let srv = TestServer::start(|| {
-        HttpService::new(App::new().service(web::resource("/").route(web::to(|| {
+    let srv = test::start(|| {
+        App::new().service(web::resource("/").route(web::to(|| {
             let mut e = GzEncoder::new(Vec::new(), Compression::default());
             e.write_all(STR.as_ref()).unwrap();
             let data = e.finish().unwrap();
@@ -418,7 +441,7 @@ async fn test_client_gzip_encoding() {
             HttpResponse::Ok()
                 .header("content-encoding", "gzip")
                 .body(data)
-        }))))
+        })))
     });
 
     // client request
@@ -432,8 +455,8 @@ async fn test_client_gzip_encoding() {
 
 #[actix_rt::test]
 async fn test_client_gzip_encoding_large() {
-    let srv = TestServer::start(|| {
-        HttpService::new(App::new().service(web::resource("/").route(web::to(|| {
+    let srv = test::start(|| {
+        App::new().service(web::resource("/").route(web::to(|| {
             let mut e = GzEncoder::new(Vec::new(), Compression::default());
             e.write_all(STR.repeat(10).as_ref()).unwrap();
             let data = e.finish().unwrap();
@@ -441,7 +464,7 @@ async fn test_client_gzip_encoding_large() {
             HttpResponse::Ok()
                 .header("content-encoding", "gzip")
                 .body(data)
-        }))))
+        })))
     });
 
     // client request
@@ -460,17 +483,15 @@ async fn test_client_gzip_encoding_large_random() {
         .take(100_000)
         .collect::<String>();
 
-    let srv = TestServer::start(|| {
-        HttpService::new(App::new().service(web::resource("/").route(web::to(
-            |data: Bytes| {
-                let mut e = GzEncoder::new(Vec::new(), Compression::default());
-                e.write_all(&data).unwrap();
-                let data = e.finish().unwrap();
-                HttpResponse::Ok()
-                    .header("content-encoding", "gzip")
-                    .body(data)
-            },
-        ))))
+    let srv = test::start(|| {
+        App::new().service(web::resource("/").route(web::to(|data: Bytes| {
+            let mut e = GzEncoder::new(Vec::new(), Compression::default());
+            e.write_all(&data).unwrap();
+            let data = e.finish().unwrap();
+            HttpResponse::Ok()
+                .header("content-encoding", "gzip")
+                .body(data)
+        })))
     });
 
     // client request
@@ -484,17 +505,15 @@ async fn test_client_gzip_encoding_large_random() {
 
 #[actix_rt::test]
 async fn test_client_brotli_encoding() {
-    let srv = TestServer::start(|| {
-        HttpService::new(App::new().service(web::resource("/").route(web::to(
-            |data: Bytes| {
-                let mut e = BrotliEncoder::new(Vec::new(), 5);
-                e.write_all(&data).unwrap();
-                let data = e.finish().unwrap();
-                HttpResponse::Ok()
-                    .header("content-encoding", "br")
-                    .body(data)
-            },
-        ))))
+    let srv = test::start(|| {
+        App::new().service(web::resource("/").route(web::to(|data: Bytes| {
+            let mut e = BrotliEncoder::new(Vec::new(), 5);
+            e.write_all(&data).unwrap();
+            let data = e.finish().unwrap();
+            HttpResponse::Ok()
+                .header("content-encoding", "br")
+                .body(data)
+        })))
     });
 
     // client request
@@ -506,41 +525,34 @@ async fn test_client_brotli_encoding() {
     assert_eq!(bytes, Bytes::from_static(STR.as_ref()));
 }
 
-// #[actix_rt::test]
-// async fn test_client_brotli_encoding_large_random() {
-//     let data = rand::thread_rng()
-//         .sample_iter(&rand::distributions::Alphanumeric)
-//         .take(70_000)
-//         .collect::<String>();
+#[actix_rt::test]
+async fn test_client_brotli_encoding_large_random() {
+    let data = rand::thread_rng()
+        .sample_iter(&rand::distributions::Alphanumeric)
+        .take(70_000)
+        .collect::<String>();
 
-//     let srv = test::TestServer::start(|app| {
-//         app.handler(|req: &HttpRequest| {
-//             req.body()
-//                 .and_then(move |bytes: Bytes| {
-//                     Ok(HttpResponse::Ok()
-//                         .content_encoding(http::ContentEncoding::Gzip)
-//                         .body(bytes))
-//                 })
-//                 .responder()
-//         })
-//     });
+    let srv = test::start(|| {
+        App::new().service(web::resource("/").route(web::to(|data: Bytes| {
+            let mut e = BrotliEncoder::new(Vec::new(), 5);
+            e.write_all(&data).unwrap();
+            let data = e.finish().unwrap();
+            HttpResponse::Ok()
+                .header("content-encoding", "br")
+                .body(data)
+        })))
+    });
 
-//     // client request
-//     let request = srv
-//         .client(http::Method::POST, "/")
-//         .content_encoding(http::ContentEncoding::Br)
-//         .body(data.clone())
-//         .unwrap();
-//     let response = request.send().await.unwrap();
-//     assert!(response.status().is_success());
+    // client request
+    let mut response = srv.post("/").send_body(data.clone()).await.unwrap();
+    assert!(response.status().is_success());
 
-//     // read response
-//     let bytes = response.body().await.unwrap();
-//     assert_eq!(bytes.len(), data.len());
-//     assert_eq!(bytes, Bytes::from(data));
-// }
+    // read response
+    let bytes = response.body().await.unwrap();
+    assert_eq!(bytes.len(), data.len());
+    assert_eq!(bytes, Bytes::from(data));
+}
 
-// #[cfg(feature = "brotli")]
 // #[actix_rt::test]
 // async fn test_client_deflate_encoding() {
 //     let srv = test::TestServer::start(|app| {
@@ -664,11 +676,11 @@ async fn test_client_cookie_handling() {
     let cookie1b = cookie1.clone();
     let cookie2b = cookie2.clone();
 
-    let srv = TestServer::start(move || {
+    let srv = test::start(move || {
         let cookie1 = cookie1b.clone();
         let cookie2 = cookie2b.clone();
 
-        HttpService::new(App::new().route(
+        App::new().route(
             "/",
             web::to(move |req: HttpRequest| {
                 let cookie1 = cookie1.clone();
@@ -706,7 +718,7 @@ async fn test_client_cookie_handling() {
                     }
                 }
             }),
-        ))
+        )
     });
 
     let request = srv.get("/").cookie(cookie1.clone()).cookie(cookie2.clone());
@@ -750,8 +762,8 @@ async fn test_client_cookie_handling() {
 
 #[actix_rt::test]
 async fn client_basic_auth() {
-    let srv = TestServer::start(|| {
-        HttpService::new(App::new().route(
+    let srv = test::start(|| {
+        App::new().route(
             "/",
             web::to(|req: HttpRequest| {
                 if req
@@ -767,7 +779,7 @@ async fn client_basic_auth() {
                     HttpResponse::BadRequest()
                 }
             }),
-        ))
+        )
     });
 
     // set authorization header to Basic <base64 encoded username:password>
@@ -778,8 +790,8 @@ async fn client_basic_auth() {
 
 #[actix_rt::test]
 async fn client_bearer_auth() {
-    let srv = TestServer::start(|| {
-        HttpService::new(App::new().route(
+    let srv = test::start(|| {
+        App::new().route(
             "/",
             web::to(|req: HttpRequest| {
                 if req
@@ -795,7 +807,7 @@ async fn client_bearer_auth() {
                     HttpResponse::BadRequest()
                 }
             }),
-        ))
+        )
     });
 
     // set authorization header to Bearer <token>

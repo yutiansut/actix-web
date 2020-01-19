@@ -1,9 +1,9 @@
 use actix_codec::{AsyncRead, AsyncWrite};
 use actix_http::{body, http::StatusCode, ws, Error, HttpService, Response};
-use actix_http_test::TestServer;
+use actix_http_test::test_server;
 use actix_service::{pipeline_factory, IntoServiceFactory, ServiceFactory};
-use actix_utils::framed::FramedTransport;
-use bytes::{Bytes, BytesMut};
+use actix_utils::framed::Dispatcher;
+use bytes::Bytes;
 use futures::{future, SinkExt, StreamExt};
 
 use actix_framed::{FramedApp, FramedRequest, FramedRoute, SendError, VerifyWebSockets};
@@ -18,7 +18,7 @@ async fn ws_service<T: AsyncRead + AsyncWrite>(
         .send((res, body::BodySize::None).into())
         .await
         .unwrap();
-    FramedTransport::new(framed.into_framed(ws::Codec::new()), service)
+    Dispatcher::new(framed.into_framed(ws::Codec::new()), service)
         .await
         .unwrap();
 
@@ -29,9 +29,9 @@ async fn service(msg: ws::Frame) -> Result<ws::Message, Error> {
     let msg = match msg {
         ws::Frame::Ping(msg) => ws::Message::Pong(msg),
         ws::Frame::Text(text) => {
-            ws::Message::Text(String::from_utf8_lossy(&text.unwrap()).to_string())
+            ws::Message::Text(String::from_utf8_lossy(&text).to_string())
         }
-        ws::Frame::Binary(bin) => ws::Message::Binary(bin.unwrap().freeze()),
+        ws::Frame::Binary(bin) => ws::Message::Binary(bin),
         ws::Frame::Close(reason) => ws::Message::Close(reason),
         _ => panic!(),
     };
@@ -40,12 +40,13 @@ async fn service(msg: ws::Frame) -> Result<ws::Message, Error> {
 
 #[actix_rt::test]
 async fn test_simple() {
-    let mut srv = TestServer::start(|| {
+    let mut srv = test_server(|| {
         HttpService::build()
             .upgrade(
                 FramedApp::new().service(FramedRoute::get("/index.html").to(ws_service)),
             )
             .finish(|_| future::ok::<_, Error>(Response::NotFound()))
+            .tcp()
     });
 
     assert!(srv.ws_at("/test").await.is_err());
@@ -59,7 +60,7 @@ async fn test_simple() {
     let (item, mut framed) = framed.into_future().await;
     assert_eq!(
         item.unwrap().unwrap(),
-        ws::Frame::Text(Some(BytesMut::from("text")))
+        ws::Frame::Text(Bytes::from_static(b"text"))
     );
 
     framed
@@ -69,7 +70,7 @@ async fn test_simple() {
     let (item, mut framed) = framed.into_future().await;
     assert_eq!(
         item.unwrap().unwrap(),
-        ws::Frame::Binary(Some(Bytes::from_static(b"text").into()))
+        ws::Frame::Binary(Bytes::from_static(b"text"))
     );
 
     framed.send(ws::Message::Ping("text".into())).await.unwrap();
@@ -93,7 +94,7 @@ async fn test_simple() {
 
 #[actix_rt::test]
 async fn test_service() {
-    let mut srv = TestServer::start(|| {
+    let mut srv = test_server(|| {
         pipeline_factory(actix_http::h1::OneRequest::new().map_err(|_| ())).and_then(
             pipeline_factory(
                 pipeline_factory(VerifyWebSockets::default())
@@ -125,7 +126,7 @@ async fn test_service() {
     let (item, mut framed) = framed.into_future().await;
     assert_eq!(
         item.unwrap().unwrap(),
-        ws::Frame::Text(Some(BytesMut::from("text")))
+        ws::Frame::Text(Bytes::from_static(b"text"))
     );
 
     framed
@@ -135,7 +136,7 @@ async fn test_service() {
     let (item, mut framed) = framed.into_future().await;
     assert_eq!(
         item.unwrap().unwrap(),
-        ws::Frame::Binary(Some(Bytes::from_static(b"text").into()))
+        ws::Frame::Binary(Bytes::from_static(b"text"))
     );
 
     framed.send(ws::Message::Ping("text".into())).await.unwrap();

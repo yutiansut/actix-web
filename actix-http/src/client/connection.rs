@@ -1,10 +1,10 @@
 use std::pin::Pin;
 use std::task::{Context, Poll};
-use std::{fmt, io, time};
+use std::{fmt, io, mem, time};
 
 use actix_codec::{AsyncRead, AsyncWrite, Framed};
 use bytes::{Buf, Bytes};
-use futures::future::{err, Either, Future, FutureExt, LocalBoxFuture, Ready};
+use futures_util::future::{err, Either, Future, FutureExt, LocalBoxFuture, Ready};
 use h2::client::SendRequest;
 use pin_project::{pin_project, project};
 
@@ -63,7 +63,7 @@ impl<T> fmt::Debug for IoConnection<T>
 where
     T: fmt::Debug,
 {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self.io {
             Some(ConnectionType::H1(ref io)) => write!(f, "H1Connection({:?})", io),
             Some(ConnectionType::H2(_)) => write!(f, "H2Connection"),
@@ -228,7 +228,10 @@ where
         }
     }
 
-    unsafe fn prepare_uninitialized_buffer(&self, buf: &mut [u8]) -> bool {
+    unsafe fn prepare_uninitialized_buffer(
+        &self,
+        buf: &mut [mem::MaybeUninit<u8>],
+    ) -> bool {
         match self {
             EitherIo::A(ref val) => val.prepare_uninitialized_buffer(buf),
             EitherIo::B(ref val) => val.prepare_uninitialized_buffer(buf),
@@ -244,7 +247,7 @@ where
     #[project]
     fn poll_write(
         self: Pin<&mut Self>,
-        cx: &mut Context,
+        cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
         #[project]

@@ -1,30 +1,23 @@
-use std::collections::VecDeque;
+use std::convert::TryFrom;
 use std::future::Future;
 use std::marker::PhantomData;
+use std::net;
 use std::pin::Pin;
 use std::task::{Context, Poll};
-use std::time::Instant;
-use std::{fmt, mem, net};
 
 use actix_codec::{AsyncRead, AsyncWrite};
-use actix_rt::time::Delay;
-use actix_server_config::IoStream;
+use actix_rt::time::{Delay, Instant};
 use actix_service::Service;
-use bitflags::bitflags;
 use bytes::{Bytes, BytesMut};
-use futures::{ready, Sink, Stream};
 use h2::server::{Connection, SendResponse};
-use h2::{RecvStream, SendStream};
-use http::header::{
-    HeaderValue, ACCEPT_ENCODING, CONNECTION, CONTENT_LENGTH, DATE, TRANSFER_ENCODING,
-};
-use http::HttpTryFrom;
-use log::{debug, error, trace};
+use h2::SendStream;
+use http::header::{HeaderValue, CONNECTION, CONTENT_LENGTH, DATE, TRANSFER_ENCODING};
+use log::{error, trace};
 
-use crate::body::{Body, BodySize, MessageBody, ResponseBody};
+use crate::body::{BodySize, MessageBody, ResponseBody};
 use crate::cloneable::CloneableService;
 use crate::config::ServiceConfig;
-use crate::error::{DispatchError, Error, ParseError, PayloadError, ResponseError};
+use crate::error::{DispatchError, Error};
 use crate::helpers::DataFactory;
 use crate::httpmessage::HttpMessage;
 use crate::message::ResponseHead;
@@ -36,7 +29,10 @@ const CHUNK_SIZE: usize = 16_384;
 
 /// Dispatcher for HTTP/2 protocol
 #[pin_project::pin_project]
-pub struct Dispatcher<T: IoStream, S: Service<Request = Request>, B: MessageBody> {
+pub struct Dispatcher<T, S: Service<Request = Request>, B: MessageBody>
+where
+    T: AsyncRead + AsyncWrite + Unpin,
+{
     service: CloneableService<S>,
     connection: Connection<T, Bytes>,
     on_connect: Option<Box<dyn DataFactory>>,
@@ -49,7 +45,7 @@ pub struct Dispatcher<T: IoStream, S: Service<Request = Request>, B: MessageBody
 
 impl<T, S, B> Dispatcher<T, S, B>
 where
-    T: IoStream,
+    T: AsyncRead + AsyncWrite + Unpin,
     S: Service<Request = Request>,
     S::Error: Into<Error>,
     // S::Future: 'static,
@@ -95,7 +91,7 @@ where
 
 impl<T, S, B> Future for Dispatcher<T, S, B>
 where
-    T: IoStream,
+    T: AsyncRead + AsyncWrite + Unpin,
     S: Service<Request = Request>,
     S::Error: Into<Error> + 'static,
     S::Future: 'static,
@@ -105,7 +101,7 @@ where
     type Output = Result<(), DispatchError>;
 
     #[inline]
-    fn poll(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Self::Output> {
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.get_mut();
 
         loop {
@@ -233,8 +229,9 @@ where
         if !has_date {
             let mut bytes = BytesMut::with_capacity(29);
             self.config.set_date_header(&mut bytes);
-            res.headers_mut()
-                .insert(DATE, HeaderValue::try_from(bytes.freeze()).unwrap());
+            res.headers_mut().insert(DATE, unsafe {
+                HeaderValue::from_maybe_shared_unchecked(bytes.freeze())
+            });
         }
 
         res
@@ -250,7 +247,7 @@ where
 {
     type Output = ();
 
-    fn poll(mut self: Pin<&mut Self>, cx: &mut Context) -> Poll<Self::Output> {
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let mut this = self.as_mut().project();
 
         match this.state {

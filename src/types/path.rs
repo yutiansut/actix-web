@@ -15,6 +15,8 @@ use crate::FromRequest;
 #[derive(PartialEq, Eq, PartialOrd, Ord)]
 /// Extract typed information from the request's path.
 ///
+/// [**PathConfig**](struct.PathConfig.html) allows to configure extraction process.
+///
 /// ## Example
 ///
 /// ```rust
@@ -97,13 +99,13 @@ impl<T> From<T> for Path<T> {
 }
 
 impl<T: fmt::Debug> fmt::Debug for Path<T> {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         self.inner.fmt(f)
     }
 }
 
 impl<T: fmt::Display> fmt::Display for Path<T> {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         self.inner.fmt(f)
     }
 }
@@ -212,7 +214,7 @@ where
 /// fn main() {
 ///     let app = App::new().service(
 ///         web::resource("/messages/{folder}")
-///             .data(PathConfig::default().error_handler(|err, req| {
+///             .app_data(PathConfig::default().error_handler(|err, req| {
 ///                 error::InternalError::from_response(
 ///                     err,
 ///                     HttpResponse::Conflict().finish(),
@@ -358,7 +360,7 @@ mod tests {
     #[actix_rt::test]
     async fn test_custom_err_handler() {
         let (req, mut pl) = TestRequest::with_uri("/name/user1/")
-            .data(PathConfig::default().error_handler(|err, _| {
+            .app_data(PathConfig::default().error_handler(|err, _| {
                 error::InternalError::from_response(
                     err,
                     HttpResponse::Conflict().finish(),

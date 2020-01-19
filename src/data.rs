@@ -56,7 +56,7 @@ pub(crate) trait DataFactory {
 ///
 ///     let app = App::new()
 ///         // Store `MyData` in application storage.
-///         .register_data(data.clone())
+///         .app_data(data.clone())
 ///         .service(
 ///             web::resource("/index.html").route(
 ///                 web::get().to(index)));
@@ -87,10 +87,10 @@ impl<T> Data<T> {
 }
 
 impl<T> Deref for Data<T> {
-    type Target = T;
+    type Target = Arc<T>;
 
-    fn deref(&self) -> &T {
-        self.0.as_ref()
+    fn deref(&self) -> &Arc<T> {
+        &self.0
     }
 }
 
@@ -107,8 +107,8 @@ impl<T: 'static> FromRequest for Data<T> {
 
     #[inline]
     fn from_request(req: &HttpRequest, _: &mut Payload) -> Self::Future {
-        if let Some(st) = req.get_app_data::<T>() {
-            ok(st)
+        if let Some(st) = req.app_data::<Data<T>>() {
+            ok(st.clone())
         } else {
             log::debug!(
                 "Failed to construct App-level Data extractor. \
@@ -136,19 +136,22 @@ impl<T: 'static> DataFactory for Data<T> {
 #[cfg(test)]
 mod tests {
     use actix_service::Service;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::*;
     use crate::http::StatusCode;
-    use crate::test::{init_service, TestRequest};
+    use crate::test::{self, init_service, TestRequest};
     use crate::{web, App, HttpResponse};
 
     #[actix_rt::test]
     async fn test_data_extractor() {
-        let mut srv =
-            init_service(App::new().data(10usize).service(
-                web::resource("/").to(|_: web::Data<usize>| HttpResponse::Ok()),
-            ))
-            .await;
+        let mut srv = init_service(App::new().data("TEST".to_string()).service(
+            web::resource("/").to(|data: web::Data<String>| {
+                assert_eq!(data.to_lowercase(), "test");
+                HttpResponse::Ok()
+            }),
+        ))
+        .await;
 
         let req = TestRequest::default().to_request();
         let resp = srv.call(req).await.unwrap();
@@ -165,9 +168,9 @@ mod tests {
     }
 
     #[actix_rt::test]
-    async fn test_register_data_extractor() {
+    async fn test_app_data_extractor() {
         let mut srv =
-            init_service(App::new().register_data(Data::new(10usize)).service(
+            init_service(App::new().app_data(Data::new(10usize)).service(
                 web::resource("/").to(|_: web::Data<usize>| HttpResponse::Ok()),
             ))
             .await;
@@ -177,7 +180,7 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
 
         let mut srv =
-            init_service(App::new().register_data(Data::new(10u32)).service(
+            init_service(App::new().app_data(Data::new(10u32)).service(
                 web::resource("/").to(|_: web::Data<usize>| HttpResponse::Ok()),
             ))
             .await;
@@ -220,7 +223,7 @@ mod tests {
         let mut srv = init_service(App::new().data(1usize).service(
             web::resource("/").data(10usize).route(web::get().to(
                 |data: web::Data<usize>| {
-                    assert_eq!(*data, 10);
+                    assert_eq!(**data, 10);
                     let _ = data.clone();
                     HttpResponse::Ok()
                 },
@@ -231,5 +234,48 @@ mod tests {
         let req = TestRequest::default().to_request();
         let resp = srv.call(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[actix_rt::test]
+    async fn test_data_drop() {
+        struct TestData(Arc<AtomicUsize>);
+
+        impl TestData {
+            fn new(inner: Arc<AtomicUsize>) -> Self {
+                let _ = inner.fetch_add(1, Ordering::SeqCst);
+                Self(inner)
+            }
+        }
+
+        impl Clone for TestData {
+            fn clone(&self) -> Self {
+                let inner = self.0.clone();
+                let _ = inner.fetch_add(1, Ordering::SeqCst);
+                Self(inner)
+            }
+        }
+
+        impl Drop for TestData {
+            fn drop(&mut self) {
+                let _ = self.0.fetch_sub(1, Ordering::SeqCst);
+            }
+        }
+
+        let num = Arc::new(AtomicUsize::new(0));
+        let data = TestData::new(num.clone());
+        assert_eq!(num.load(Ordering::SeqCst), 1);
+
+        let srv = test::start(move || {
+            let data = data.clone();
+
+            App::new()
+                .data(data)
+                .service(web::resource("/").to(|_data: Data<TestData>| async { "ok" }))
+        });
+
+        assert!(srv.get("/").send().await.unwrap().status().is_success());
+        srv.stop().await;
+
+        assert_eq!(num.load(Ordering::SeqCst), 0);
     }
 }

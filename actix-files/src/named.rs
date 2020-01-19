@@ -12,11 +12,11 @@ use mime;
 use mime_guess::from_path;
 
 use actix_http::body::SizedStream;
+use actix_web::dev::BodyEncoding;
 use actix_web::http::header::{
     self, Charset, ContentDisposition, DispositionParam, DispositionType, ExtendedValue,
 };
 use actix_web::http::{ContentEncoding, StatusCode};
-use actix_web::middleware::BodyEncoding;
 use actix_web::{Error, HttpMessage, HttpRequest, HttpResponse, Responder};
 use futures::future::{ready, Ready};
 

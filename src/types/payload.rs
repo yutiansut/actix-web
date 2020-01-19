@@ -59,7 +59,7 @@ impl Stream for Payload {
     #[inline]
     fn poll_next(
         mut self: Pin<&mut Self>,
-        cx: &mut Context,
+        cx: &mut Context<'_>,
     ) -> Poll<Option<Self::Item>> {
         Pin::new(&mut self.0).poll_next(cx)
     }
@@ -176,7 +176,7 @@ impl FromRequest for Bytes {
 /// fn main() {
 ///     let app = App::new().service(
 ///         web::resource("/index.html")
-///             .data(String::configure(|cfg| {  // <- limit size of the payload
+///             .app_data(String::configure(|cfg| {  // <- limit size of the payload
 ///                 cfg.limit(4096)
 ///             }))
 ///             .route(web::get().to(index))  // <- register handler with extractor params
@@ -229,7 +229,7 @@ impl FromRequest for String {
                         .ok_or_else(|| ErrorBadRequest("Can not decode body"))?)
                 }
             }
-                .boxed_local(),
+            .boxed_local(),
         )
     }
 }
@@ -301,7 +301,10 @@ impl Default for PayloadConfig {
 pub struct HttpMessageBody {
     limit: usize,
     length: Option<usize>,
+    #[cfg(feature = "compress")]
     stream: Option<dev::Decompress<dev::Payload>>,
+    #[cfg(not(feature = "compress"))]
+    stream: Option<dev::Payload>,
     err: Option<PayloadError>,
     fut: Option<LocalBoxFuture<'static, Result<Bytes, PayloadError>>>,
 }
@@ -322,8 +325,13 @@ impl HttpMessageBody {
             }
         }
 
+        #[cfg(feature = "compress")]
+        let stream = Some(dev::Decompress::from_headers(payload.take(), req.headers()));
+        #[cfg(not(feature = "compress"))]
+        let stream = Some(payload.take());
+
         HttpMessageBody {
-            stream: Some(dev::Decompress::from_headers(payload.take(), req.headers())),
+            stream,
             limit: 262_144,
             length: len,
             fut: None,
@@ -351,7 +359,7 @@ impl HttpMessageBody {
 impl Future for HttpMessageBody {
     type Output = Result<Bytes, PayloadError>;
 
-    fn poll(mut self: Pin<&mut Self>, cx: &mut Context) -> Poll<Self::Output> {
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         if let Some(ref mut fut) = self.fut {
             return Pin::new(fut).poll(cx);
         }
@@ -383,7 +391,7 @@ impl Future for HttpMessageBody {
                 }
                 Ok(body.freeze())
             }
-                .boxed_local(),
+            .boxed_local(),
         );
         self.poll(cx)
     }

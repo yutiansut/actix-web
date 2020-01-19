@@ -11,9 +11,9 @@ use actix_rt::time::{delay_for, Delay};
 use actix_service::Service;
 use actix_utils::{oneshot, task::LocalWaker};
 use bytes::Bytes;
-use futures::future::{poll_fn, FutureExt, LocalBoxFuture};
+use futures_util::future::{poll_fn, FutureExt, LocalBoxFuture};
+use fxhash::FxHashMap;
 use h2::client::{handshake, Connection, SendRequest};
-use hashbrown::HashMap;
 use http::uri::Authority;
 use indexmap::IndexSet;
 use slab::Slab;
@@ -66,7 +66,7 @@ where
                 acquired: 0,
                 waiters: Slab::new(),
                 waiters_queue: IndexSet::new(),
-                available: HashMap::new(),
+                available: FxHashMap::default(),
                 waker: LocalWaker::new(),
             })),
         )
@@ -93,7 +93,7 @@ where
     type Error = ConnectError;
     type Future = LocalBoxFuture<'static, Result<IoConnection<Io>, ConnectError>>;
 
-    fn poll_ready(&mut self, cx: &mut Context) -> Poll<Result<(), Self::Error>> {
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         self.0.poll_ready(cx)
     }
 
@@ -108,7 +108,7 @@ where
         let inner = self.1.clone();
 
         let fut = async move {
-            let key = if let Some(authority) = req.uri.authority_part() {
+            let key = if let Some(authority) = req.uri.authority() {
                 authority.clone().into()
             } else {
                 return Err(ConnectError::Unresolverd);
@@ -259,7 +259,7 @@ pub(crate) struct Inner<Io> {
     disconnect_timeout: Option<Duration>,
     limit: usize,
     acquired: usize,
-    available: HashMap<Key, VecDeque<AvailableConnection<Io>>>,
+    available: FxHashMap<Key, VecDeque<AvailableConnection<Io>>>,
     waiters: Slab<
         Option<(
             Connect,
@@ -299,7 +299,7 @@ where
     ) {
         let (tx, rx) = oneshot::channel();
 
-        let key: Key = connect.uri.authority_part().unwrap().clone().into();
+        let key: Key = connect.uri.authority().unwrap().clone().into();
         let entry = self.waiters.vacant_entry();
         let token = entry.key();
         entry.insert(Some((connect, tx)));
@@ -308,7 +308,7 @@ where
         (rx, token)
     }
 
-    fn acquire(&mut self, key: &Key, cx: &mut Context) -> Acquire<Io> {
+    fn acquire(&mut self, key: &Key, cx: &mut Context<'_>) -> Acquire<Io> {
         // check limits
         if self.limit > 0 && self.acquired >= self.limit {
             return Acquire::NotAvailable;
@@ -409,7 +409,7 @@ where
 {
     type Output = ();
 
-    fn poll(self: Pin<&mut Self>, cx: &mut Context) -> Poll<()> {
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
         let this = self.get_mut();
 
         match Pin::new(&mut this.timeout).poll(cx) {
@@ -438,7 +438,7 @@ where
 {
     type Output = ();
 
-    fn poll(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Self::Output> {
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = unsafe { self.get_unchecked_mut() };
 
         let mut inner = this.inner.as_ref().borrow_mut();
@@ -545,7 +545,7 @@ where
 {
     type Output = ();
 
-    fn poll(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Self::Output> {
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = unsafe { self.get_unchecked_mut() };
 
         if let Some(ref mut h2) = this.h2 {

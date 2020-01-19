@@ -5,8 +5,7 @@ use std::{net, thread, time::Duration};
 #[cfg(feature = "openssl")]
 use open_ssl::ssl::SslAcceptorBuilder;
 
-use actix_http::Response;
-use actix_web::{web, App, HttpServer};
+use actix_web::{web, App, HttpResponse, HttpServer};
 
 fn unused_addr() -> net::SocketAddr {
     let addr: net::SocketAddr = "127.0.0.1:0".parse().unwrap();
@@ -28,7 +27,7 @@ async fn test_start() {
 
         let srv = HttpServer::new(|| {
             App::new().service(
-                web::resource("/").route(web::to(|| Response::Ok().body("test"))),
+                web::resource("/").route(web::to(|| HttpResponse::Ok().body("test"))),
             )
         })
         .workers(1)
@@ -43,7 +42,7 @@ async fn test_start() {
         .disable_signals()
         .bind(format!("{}", addr))
         .unwrap()
-        .start();
+        .run();
 
         let _ = tx.send((srv, actix_rt::System::current()));
         let _ = sys.run();
@@ -91,6 +90,8 @@ fn ssl_acceptor() -> std::io::Result<SslAcceptorBuilder> {
 #[actix_rt::test]
 #[cfg(feature = "openssl")]
 async fn test_start_ssl() {
+    use actix_web::HttpRequest;
+
     let addr = unused_addr();
     let (tx, rx) = mpsc::channel();
 
@@ -99,9 +100,10 @@ async fn test_start_ssl() {
         let builder = ssl_acceptor().unwrap();
 
         let srv = HttpServer::new(|| {
-            App::new().service(
-                web::resource("/").route(web::to(|| Response::Ok().body("test"))),
-            )
+            App::new().service(web::resource("/").route(web::to(|req: HttpRequest| {
+                assert!(req.app_config().secure());
+                HttpResponse::Ok().body("test")
+            })))
         })
         .workers(1)
         .shutdown_timeout(1)
@@ -109,7 +111,7 @@ async fn test_start_ssl() {
         .disable_signals()
         .bind_openssl(format!("{}", addr), builder)
         .unwrap()
-        .start();
+        .run();
 
         let _ = tx.send((srv, actix_rt::System::current()));
         let _ = sys.run();

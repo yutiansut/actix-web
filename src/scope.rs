@@ -148,15 +148,13 @@ where
     /// }
     /// ```
     pub fn data<U: 'static>(self, data: U) -> Self {
-        self.register_data(Data::new(data))
+        self.app_data(Data::new(data))
     }
 
     /// Set or override application data.
     ///
-    /// This method has the same effect as [`Scope::data`](#method.data), except
-    /// that instead of taking a value of some type `T`, it expects a value of
-    /// type `Data<T>`. Use a `Data<T>` extractor to retrieve its value.
-    pub fn register_data<U: 'static>(mut self, data: Data<U>) -> Self {
+    /// This method overrides data stored with [`App::app_data()`](#method.app_data)
+    pub fn app_data<U: 'static>(mut self, data: U) -> Self {
         if self.data.is_none() {
             self.data = Some(Extensions::new());
         }
@@ -488,9 +486,9 @@ impl ServiceFactory for ScopeFactory {
     type Service = ScopeService;
     type Future = ScopeFactoryResponse;
 
-    fn new_service(&self, _: &()) -> Self::Future {
+    fn new_service(&self, _: ()) -> Self::Future {
         let default_fut = if let Some(ref default) = *self.default.borrow() {
-            Some(default.new_service(&()))
+            Some(default.new_service(()))
         } else {
             None
         };
@@ -503,7 +501,7 @@ impl ServiceFactory for ScopeFactory {
                     CreateScopeServiceItem::Future(
                         Some(path.clone()),
                         guards.borrow_mut().take(),
-                        service.new_service(&()),
+                        service.new_service(()),
                     )
                 })
                 .collect(),
@@ -534,7 +532,7 @@ enum CreateScopeServiceItem {
 impl Future for ScopeFactoryResponse {
     type Output = Result<ScopeService, ()>;
 
-    fn poll(mut self: Pin<&mut Self>, cx: &mut Context) -> Poll<Self::Output> {
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let mut done = true;
 
         if let Some(ref mut fut) = self.default_fut {
@@ -606,7 +604,7 @@ impl Service for ScopeService {
     type Error = Error;
     type Future = Either<BoxedResponse, Ready<Result<Self::Response, Self::Error>>>;
 
-    fn poll_ready(&mut self, _: &mut Context) -> Poll<Result<(), Self::Error>> {
+    fn poll_ready(&mut self, _: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         Poll::Ready(Ok(()))
     }
 
@@ -656,8 +654,8 @@ impl ServiceFactory for ScopeEndpoint {
     type Service = ScopeService;
     type Future = ScopeFactoryResponse;
 
-    fn new_service(&self, _: &()) -> Self::Future {
-        self.factory.borrow_mut().as_mut().unwrap().new_service(&())
+    fn new_service(&self, _: ()) -> Self::Future {
+        self.factory.borrow_mut().as_mut().unwrap().new_service(())
     }
 }
 
@@ -1108,7 +1106,7 @@ mod tests {
             web::scope("app").data(10usize).route(
                 "/t",
                 web::get().to(|data: web::Data<usize>| {
-                    assert_eq!(*data, 10);
+                    assert_eq!(**data, 10);
                     let _ = data.clone();
                     HttpResponse::Ok()
                 }),
@@ -1122,21 +1120,17 @@ mod tests {
     }
 
     #[actix_rt::test]
-    async fn test_override_register_data() {
-        let mut srv = init_service(
-            App::new().register_data(web::Data::new(1usize)).service(
-                web::scope("app")
-                    .register_data(web::Data::new(10usize))
-                    .route(
-                        "/t",
-                        web::get().to(|data: web::Data<usize>| {
-                            assert_eq!(*data, 10);
-                            let _ = data.clone();
-                            HttpResponse::Ok()
-                        }),
-                    ),
+    async fn test_override_app_data() {
+        let mut srv = init_service(App::new().app_data(web::Data::new(1usize)).service(
+            web::scope("app").app_data(web::Data::new(10usize)).route(
+                "/t",
+                web::get().to(|data: web::Data<usize>| {
+                    assert_eq!(**data, 10);
+                    let _ = data.clone();
+                    HttpResponse::Ok()
+                }),
             ),
-        )
+        ))
         .await;
 
         let req = TestRequest::with_uri("/app/t").to_request();

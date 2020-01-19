@@ -1,5 +1,6 @@
 //! Multipart payload support
 use std::cell::{Cell, RefCell, RefMut};
+use std::convert::TryFrom;
 use std::marker::PhantomData;
 use std::pin::Pin;
 use std::rc::Rc;
@@ -16,7 +17,6 @@ use actix_web::error::{ParseError, PayloadError};
 use actix_web::http::header::{
     self, ContentDisposition, HeaderMap, HeaderName, HeaderValue,
 };
-use actix_web::http::HttpTryFrom;
 
 use crate::error::MultipartError;
 
@@ -582,7 +582,7 @@ impl InnerField {
                     }
                 }
             } else {
-                Poll::Ready(Some(Ok(payload.buf.take().freeze())))
+                Poll::Ready(Some(Ok(payload.buf.split().freeze())))
             };
         }
     }
@@ -610,7 +610,7 @@ impl InnerField {
             }
 
             match payload.readline() {
-                Ok(None) => Poll::Ready(None),
+                Ok(None) => Poll::Pending,
                 Ok(Some(line)) => {
                     if line.as_ref() != b"\r\n" {
                         log::warn!("multipart field did not read all the data or it is malformed");
@@ -792,7 +792,7 @@ impl PayloadBuffer {
     pub fn readline_or_eof(&mut self) -> Result<Option<Bytes>, MultipartError> {
         match self.readline() {
             Err(MultipartError::Incomplete) if self.eof => {
-                Ok(Some(self.buf.take().freeze()))
+                Ok(Some(self.buf.split().freeze()))
             }
             line => line,
         }
@@ -800,7 +800,7 @@ impl PayloadBuffer {
 
     /// Put unprocessed data back to the buffer
     pub fn unprocessed(&mut self, data: Bytes) {
-        let buf = BytesMut::from(data);
+        let buf = BytesMut::from(data.as_ref());
         let buf = std::mem::replace(&mut self.buf, buf);
         self.buf.extend_from_slice(&buf);
     }
@@ -867,6 +867,45 @@ mod tests {
 
         (tx, rx.map(|res| res.map_err(|_| panic!())))
     }
+    // Stream that returns from a Bytes, one char at a time and Pending every other poll()
+    struct SlowStream {
+        bytes: Bytes,
+        pos: usize,
+        ready: bool,
+    }
+
+    impl SlowStream {
+        fn new(bytes: Bytes) -> SlowStream {
+            return SlowStream {
+                bytes: bytes,
+                pos: 0,
+                ready: false,
+            };
+        }
+    }
+
+    impl Stream for SlowStream {
+        type Item = Result<Bytes, PayloadError>;
+
+        fn poll_next(
+            self: Pin<&mut Self>,
+            cx: &mut Context,
+        ) -> Poll<Option<Self::Item>> {
+            let this = self.get_mut();
+            if !this.ready {
+                this.ready = true;
+                cx.waker().wake_by_ref();
+                return Poll::Pending;
+            }
+            if this.pos == this.bytes.len() {
+                return Poll::Ready(None);
+            }
+            let res = Poll::Ready(Some(Ok(this.bytes.slice(this.pos..(this.pos + 1)))));
+            this.pos += 1;
+            this.ready = false;
+            res
+        }
+    }
 
     fn create_simple_request_with_header() -> (Bytes, HeaderMap) {
         let bytes = Bytes::from(
@@ -893,8 +932,8 @@ mod tests {
     #[actix_rt::test]
     async fn test_multipart_no_end_crlf() {
         let (sender, payload) = create_stream();
-        let (bytes, headers) = create_simple_request_with_header();
-        let bytes_stripped = bytes.slice_to(bytes.len()); // strip crlf
+        let (mut bytes, headers) = create_simple_request_with_header();
+        let bytes_stripped = bytes.split_to(bytes.len()); // strip crlf
 
         sender.send(Ok(bytes_stripped)).unwrap();
         drop(sender); // eof
@@ -969,12 +1008,22 @@ mod tests {
         }
     }
 
+    // Loops, collecting all bytes until end-of-field
+    async fn get_whole_field(field: &mut Field) -> BytesMut {
+        let mut b = BytesMut::new();
+        loop {
+            match field.next().await {
+                Some(Ok(chunk)) => b.extend_from_slice(&chunk),
+                None => return b,
+                _ => unreachable!(),
+            }
+        }
+    }
+
     #[actix_rt::test]
     async fn test_stream() {
-        let (sender, payload) = create_stream();
         let (bytes, headers) = create_simple_request_with_header();
-
-        sender.send(Ok(bytes)).unwrap();
+        let payload = SlowStream::new(bytes);
 
         let mut multipart = Multipart::new(&headers, payload);
         match multipart.next().await.unwrap() {
@@ -986,14 +1035,7 @@ mod tests {
                 assert_eq!(field.content_type().type_(), mime::TEXT);
                 assert_eq!(field.content_type().subtype(), mime::PLAIN);
 
-                match field.next().await.unwrap() {
-                    Ok(chunk) => assert_eq!(chunk, "test"),
-                    _ => unreachable!(),
-                }
-                match field.next().await {
-                    None => (),
-                    _ => unreachable!(),
-                }
+                assert_eq!(get_whole_field(&mut field).await, "test");
             }
             _ => unreachable!(),
         }
@@ -1003,14 +1045,7 @@ mod tests {
                 assert_eq!(field.content_type().type_(), mime::TEXT);
                 assert_eq!(field.content_type().subtype(), mime::PLAIN);
 
-                match field.next().await {
-                    Some(Ok(chunk)) => assert_eq!(chunk, "data"),
-                    _ => unreachable!(),
-                }
-                match field.next().await {
-                    None => (),
-                    _ => unreachable!(),
-                }
+                assert_eq!(get_whole_field(&mut field).await, "data");
             }
             _ => unreachable!(),
         }

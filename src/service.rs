@@ -8,7 +8,7 @@ use actix_http::{
     Error, Extensions, HttpMessage, Payload, PayloadStream, RequestHead, Response,
     ResponseHead,
 };
-use actix_router::{Path, Resource, ResourceDef, Url};
+use actix_router::{IntoPattern, Path, Resource, ResourceDef, Url};
 use actix_service::{IntoServiceFactory, ServiceFactory};
 
 use crate::config::{AppConfig, AppService};
@@ -181,7 +181,7 @@ impl ServiceRequest {
 
     /// Get *ConnectionInfo* for the current request.
     #[inline]
-    pub fn connection_info(&self) -> Ref<ConnectionInfo> {
+    pub fn connection_info(&self) -> Ref<'_, ConnectionInfo> {
         ConnectionInfo::get(self.head(), &*self.app_config())
     }
 
@@ -253,13 +253,13 @@ impl HttpMessage for ServiceRequest {
 
     /// Request extensions
     #[inline]
-    fn extensions(&self) -> Ref<Extensions> {
+    fn extensions(&self) -> Ref<'_, Extensions> {
         self.0.extensions()
     }
 
     /// Mutable reference to a the request's extensions
     #[inline]
-    fn extensions_mut(&self) -> RefMut<Extensions> {
+    fn extensions_mut(&self) -> RefMut<'_, Extensions> {
         self.0.extensions_mut()
     }
 
@@ -270,7 +270,7 @@ impl HttpMessage for ServiceRequest {
 }
 
 impl fmt::Debug for ServiceRequest {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         writeln!(
             f,
             "\nServiceRequest {:?} {}:{}",
@@ -404,7 +404,7 @@ impl<B> Into<Response<B>> for ServiceResponse<B> {
 }
 
 impl<B: MessageBody> fmt::Debug for ServiceResponse<B> {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let res = writeln!(
             f,
             "\nServiceResponse {:?} {}{}",
@@ -422,16 +422,16 @@ impl<B: MessageBody> fmt::Debug for ServiceResponse<B> {
 }
 
 pub struct WebService {
-    rdef: String,
+    rdef: Vec<String>,
     name: Option<String>,
     guards: Vec<Box<dyn Guard>>,
 }
 
 impl WebService {
     /// Create new `WebService` instance.
-    pub fn new(path: &str) -> Self {
+    pub fn new<T: IntoPattern>(path: T) -> Self {
         WebService {
-            rdef: path.to_string(),
+            rdef: path.patterns(),
             name: None,
             guards: Vec::new(),
         }
@@ -491,7 +491,7 @@ impl WebService {
 
 struct WebServiceImpl<T> {
     srv: T,
-    rdef: String,
+    rdef: Vec<String>,
     name: Option<String>,
     guards: Vec<Box<dyn Guard>>,
 }
@@ -514,9 +514,9 @@ where
         };
 
         let mut rdef = if config.is_root() || !self.rdef.is_empty() {
-            ResourceDef::new(&insert_slash(&self.rdef))
+            ResourceDef::new(insert_slash(self.rdef))
         } else {
-            ResourceDef::new(&self.rdef)
+            ResourceDef::new(self.rdef)
         };
         if let Some(ref name) = self.name {
             *rdef.name_mut() = name.clone();

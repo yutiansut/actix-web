@@ -2,7 +2,7 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 
 use bytes::Bytes;
-use futures::Stream;
+use futures_core::Stream;
 use h2::RecvStream;
 
 use crate::error::PayloadError;
@@ -56,7 +56,10 @@ where
     type Item = Result<Bytes, PayloadError>;
 
     #[inline]
-    fn poll_next(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Option<Self::Item>> {
+    fn poll_next(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Self::Item>> {
         match self.get_mut() {
             Payload::None => Poll::Ready(None),
             Payload::H1(ref mut pl) => pl.readany(cx),

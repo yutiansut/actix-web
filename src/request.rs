@@ -8,7 +8,6 @@ use actix_router::{Path, Url};
 use futures::future::{ok, Ready};
 
 use crate::config::AppConfig;
-use crate::data::Data;
 use crate::error::UrlGenerationError;
 use crate::extract::FromRequest;
 use crate::info::ConnectionInfo;
@@ -125,13 +124,13 @@ impl HttpRequest {
 
     /// Request extensions
     #[inline]
-    pub fn extensions(&self) -> Ref<Extensions> {
+    pub fn extensions(&self) -> Ref<'_, Extensions> {
         self.head().extensions()
     }
 
     /// Mutable reference to a the request's extensions
     #[inline]
-    pub fn extensions_mut(&self) -> RefMut<Extensions> {
+    pub fn extensions_mut(&self) -> RefMut<'_, Extensions> {
         self.head().extensions_mut()
     }
 
@@ -197,7 +196,7 @@ impl HttpRequest {
     /// This method panics if request's extensions container is already
     /// borrowed.
     #[inline]
-    pub fn connection_info(&self) -> Ref<ConnectionInfo> {
+    pub fn connection_info(&self) -> Ref<'_, ConnectionInfo> {
         ConnectionInfo::get(self.head(), &*self.app_config())
     }
 
@@ -207,21 +206,17 @@ impl HttpRequest {
         &self.0.config
     }
 
-    /// Get an application data stored with `App::data()` method during
-    /// application configuration.
+    /// Get an application data object stored with `App::data` or `App::app_data`
+    /// methods during application configuration.
+    ///
+    /// If `App::data` was used to store object, use `Data<T>`:
+    ///
+    /// ```rust,ignore
+    /// let opt_t = req.app_data::<Data<T>>();
+    /// ```
     pub fn app_data<T: 'static>(&self) -> Option<&T> {
-        if let Some(st) = self.0.app_data.get::<Data<T>>() {
+        if let Some(st) = self.0.app_data.get::<T>() {
             Some(&st)
-        } else {
-            None
-        }
-    }
-
-    /// Get an application data stored with `App::data()` method during
-    /// application configuration.
-    pub fn get_app_data<T: 'static>(&self) -> Option<Data<T>> {
-        if let Some(st) = self.0.app_data.get::<Data<T>>() {
-            Some(st.clone())
         } else {
             None
         }
@@ -239,13 +234,13 @@ impl HttpMessage for HttpRequest {
 
     /// Request extensions
     #[inline]
-    fn extensions(&self) -> Ref<Extensions> {
+    fn extensions(&self) -> Ref<'_, Extensions> {
         self.0.head.extensions()
     }
 
     /// Mutable reference to a the request's extensions
     #[inline]
-    fn extensions_mut(&self) -> RefMut<Extensions> {
+    fn extensions_mut(&self) -> RefMut<'_, Extensions> {
         self.0.head.extensions_mut()
     }
 
@@ -299,7 +294,7 @@ impl FromRequest for HttpRequest {
 }
 
 impl fmt::Debug for HttpRequest {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         writeln!(
             f,
             "\nHttpRequest {:?} {}:{}",
@@ -467,8 +462,8 @@ mod tests {
     }
 
     #[actix_rt::test]
-    async fn test_app_data() {
-        let mut srv = init_service(App::new().data(10usize).service(
+    async fn test_data() {
+        let mut srv = init_service(App::new().app_data(10usize).service(
             web::resource("/").to(|req: HttpRequest| {
                 if req.app_data::<usize>().is_some() {
                     HttpResponse::Ok()
@@ -483,7 +478,7 @@ mod tests {
         let resp = call_service(&mut srv, req).await;
         assert_eq!(resp.status(), StatusCode::OK);
 
-        let mut srv = init_service(App::new().data(10u32).service(
+        let mut srv = init_service(App::new().app_data(10u32).service(
             web::resource("/").to(|req: HttpRequest| {
                 if req.app_data::<usize>().is_some() {
                     HttpResponse::Ok()

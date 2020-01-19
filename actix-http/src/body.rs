@@ -4,7 +4,7 @@ use std::task::{Context, Poll};
 use std::{fmt, mem};
 
 use bytes::{Bytes, BytesMut};
-use futures::Stream;
+use futures_core::Stream;
 use pin_project::{pin_project, project};
 
 use crate::error::Error;
@@ -35,7 +35,7 @@ impl BodySize {
 pub trait MessageBody {
     fn size(&self) -> BodySize;
 
-    fn poll_next(&mut self, cx: &mut Context) -> Poll<Option<Result<Bytes, Error>>>;
+    fn poll_next(&mut self, cx: &mut Context<'_>) -> Poll<Option<Result<Bytes, Error>>>;
 }
 
 impl MessageBody for () {
@@ -43,7 +43,7 @@ impl MessageBody for () {
         BodySize::Empty
     }
 
-    fn poll_next(&mut self, _: &mut Context) -> Poll<Option<Result<Bytes, Error>>> {
+    fn poll_next(&mut self, _: &mut Context<'_>) -> Poll<Option<Result<Bytes, Error>>> {
         Poll::Ready(None)
     }
 }
@@ -53,7 +53,7 @@ impl<T: MessageBody> MessageBody for Box<T> {
         self.as_ref().size()
     }
 
-    fn poll_next(&mut self, cx: &mut Context) -> Poll<Option<Result<Bytes, Error>>> {
+    fn poll_next(&mut self, cx: &mut Context<'_>) -> Poll<Option<Result<Bytes, Error>>> {
         self.as_mut().poll_next(cx)
     }
 }
@@ -97,7 +97,7 @@ impl<B: MessageBody> MessageBody for ResponseBody<B> {
         }
     }
 
-    fn poll_next(&mut self, cx: &mut Context) -> Poll<Option<Result<Bytes, Error>>> {
+    fn poll_next(&mut self, cx: &mut Context<'_>) -> Poll<Option<Result<Bytes, Error>>> {
         match self {
             ResponseBody::Body(ref mut body) => body.poll_next(cx),
             ResponseBody::Other(ref mut body) => body.poll_next(cx),
@@ -109,7 +109,10 @@ impl<B: MessageBody> Stream for ResponseBody<B> {
     type Item = Result<Bytes, Error>;
 
     #[project]
-    fn poll_next(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Option<Self::Item>> {
+    fn poll_next(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Self::Item>> {
         #[project]
         match self.project() {
             ResponseBody::Body(ref mut body) => body.poll_next(cx),
@@ -133,7 +136,7 @@ pub enum Body {
 impl Body {
     /// Create body from slice (copy)
     pub fn from_slice(s: &[u8]) -> Body {
-        Body::Bytes(Bytes::from(s))
+        Body::Bytes(Bytes::copy_from_slice(s))
     }
 
     /// Create body from generic message body.
@@ -152,7 +155,7 @@ impl MessageBody for Body {
         }
     }
 
-    fn poll_next(&mut self, cx: &mut Context) -> Poll<Option<Result<Bytes, Error>>> {
+    fn poll_next(&mut self, cx: &mut Context<'_>) -> Poll<Option<Result<Bytes, Error>>> {
         match self {
             Body::None => Poll::Ready(None),
             Body::Empty => Poll::Ready(None),
@@ -190,7 +193,7 @@ impl PartialEq for Body {
 }
 
 impl fmt::Debug for Body {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match *self {
             Body::None => write!(f, "Body::None"),
             Body::Empty => write!(f, "Body::Empty"),
@@ -226,7 +229,7 @@ impl From<String> for Body {
 
 impl<'a> From<&'a String> for Body {
     fn from(s: &'a String) -> Body {
-        Body::Bytes(Bytes::from(AsRef::<[u8]>::as_ref(&s)))
+        Body::Bytes(Bytes::copy_from_slice(AsRef::<[u8]>::as_ref(&s)))
     }
 }
 
@@ -272,7 +275,7 @@ impl MessageBody for Bytes {
         BodySize::Sized(self.len())
     }
 
-    fn poll_next(&mut self, _: &mut Context) -> Poll<Option<Result<Bytes, Error>>> {
+    fn poll_next(&mut self, _: &mut Context<'_>) -> Poll<Option<Result<Bytes, Error>>> {
         if self.is_empty() {
             Poll::Ready(None)
         } else {
@@ -286,7 +289,7 @@ impl MessageBody for BytesMut {
         BodySize::Sized(self.len())
     }
 
-    fn poll_next(&mut self, _: &mut Context) -> Poll<Option<Result<Bytes, Error>>> {
+    fn poll_next(&mut self, _: &mut Context<'_>) -> Poll<Option<Result<Bytes, Error>>> {
         if self.is_empty() {
             Poll::Ready(None)
         } else {
@@ -300,7 +303,7 @@ impl MessageBody for &'static str {
         BodySize::Sized(self.len())
     }
 
-    fn poll_next(&mut self, _: &mut Context) -> Poll<Option<Result<Bytes, Error>>> {
+    fn poll_next(&mut self, _: &mut Context<'_>) -> Poll<Option<Result<Bytes, Error>>> {
         if self.is_empty() {
             Poll::Ready(None)
         } else {
@@ -316,7 +319,7 @@ impl MessageBody for &'static [u8] {
         BodySize::Sized(self.len())
     }
 
-    fn poll_next(&mut self, _: &mut Context) -> Poll<Option<Result<Bytes, Error>>> {
+    fn poll_next(&mut self, _: &mut Context<'_>) -> Poll<Option<Result<Bytes, Error>>> {
         if self.is_empty() {
             Poll::Ready(None)
         } else {
@@ -330,7 +333,7 @@ impl MessageBody for Vec<u8> {
         BodySize::Sized(self.len())
     }
 
-    fn poll_next(&mut self, _: &mut Context) -> Poll<Option<Result<Bytes, Error>>> {
+    fn poll_next(&mut self, _: &mut Context<'_>) -> Poll<Option<Result<Bytes, Error>>> {
         if self.is_empty() {
             Poll::Ready(None)
         } else {
@@ -344,7 +347,7 @@ impl MessageBody for String {
         BodySize::Sized(self.len())
     }
 
-    fn poll_next(&mut self, _: &mut Context) -> Poll<Option<Result<Bytes, Error>>> {
+    fn poll_next(&mut self, _: &mut Context<'_>) -> Poll<Option<Result<Bytes, Error>>> {
         if self.is_empty() {
             Poll::Ready(None)
         } else {
@@ -386,7 +389,7 @@ where
         BodySize::Stream
     }
 
-    fn poll_next(&mut self, cx: &mut Context) -> Poll<Option<Result<Bytes, Error>>> {
+    fn poll_next(&mut self, cx: &mut Context<'_>) -> Poll<Option<Result<Bytes, Error>>> {
         unsafe { Pin::new_unchecked(self) }
             .project()
             .stream
@@ -421,7 +424,7 @@ where
         BodySize::Sized64(self.size)
     }
 
-    fn poll_next(&mut self, cx: &mut Context) -> Poll<Option<Result<Bytes, Error>>> {
+    fn poll_next(&mut self, cx: &mut Context<'_>) -> Poll<Option<Result<Bytes, Error>>> {
         unsafe { Pin::new_unchecked(self) }
             .project()
             .stream
@@ -432,7 +435,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use futures::future::poll_fn;
+    use futures_util::future::poll_fn;
 
     impl Body {
         pub(crate) fn get_ref(&self) -> &[u8] {

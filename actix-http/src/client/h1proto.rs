@@ -1,12 +1,14 @@
 use std::io::Write;
 use std::pin::Pin;
 use std::task::{Context, Poll};
-use std::{io, time};
+use std::{io, mem, time};
 
 use actix_codec::{AsyncRead, AsyncWrite, Framed};
-use bytes::{BufMut, Bytes, BytesMut};
-use futures::future::poll_fn;
-use futures::{SinkExt, Stream, StreamExt};
+use bytes::buf::BufMutExt;
+use bytes::{Bytes, BytesMut};
+use futures_core::Stream;
+use futures_util::future::poll_fn;
+use futures_util::{SinkExt, StreamExt};
 
 use crate::error::PayloadError;
 use crate::h1;
@@ -43,7 +45,7 @@ where
                 Some(port) => write!(wrt, "{}:{}", host, port),
             };
 
-            match wrt.get_mut().take().freeze().try_into() {
+            match wrt.get_mut().split().freeze().try_into() {
                 Ok(value) => match head {
                     RequestHeadType::Owned(ref mut head) => {
                         head.headers.insert(HOST, value)
@@ -199,7 +201,10 @@ where
 }
 
 impl<T: AsyncRead + AsyncWrite + Unpin + 'static> AsyncRead for H1Connection<T> {
-    unsafe fn prepare_uninitialized_buffer(&self, buf: &mut [u8]) -> bool {
+    unsafe fn prepare_uninitialized_buffer(
+        &self,
+        buf: &mut [mem::MaybeUninit<u8>],
+    ) -> bool {
         self.io.as_ref().unwrap().prepare_uninitialized_buffer(buf)
     }
 
@@ -230,7 +235,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin + 'static> AsyncWrite for H1Connection<T>
 
     fn poll_shutdown(
         mut self: Pin<&mut Self>,
-        cx: &mut Context,
+        cx: &mut Context<'_>,
     ) -> Poll<Result<(), io::Error>> {
         Pin::new(self.io.as_mut().unwrap()).poll_shutdown(cx)
     }
@@ -251,7 +256,10 @@ impl<Io: ConnectionLifetime> PlStream<Io> {
 impl<Io: ConnectionLifetime> Stream for PlStream<Io> {
     type Item = Result<Bytes, PayloadError>;
 
-    fn poll_next(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Option<Self::Item>> {
+    fn poll_next(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Self::Item>> {
         let this = self.get_mut();
 
         match this.framed.as_mut().unwrap().next_item(cx)? {

@@ -16,6 +16,7 @@ use serde_json;
 use actix_http::http::{header::CONTENT_LENGTH, StatusCode};
 use actix_http::{HttpMessage, Payload, Response};
 
+#[cfg(feature = "compress")]
 use crate::dev::Decompress;
 use crate::error::{Error, JsonPayloadError};
 use crate::extract::FromRequest;
@@ -106,7 +107,7 @@ impl<T> fmt::Debug for Json<T>
 where
     T: fmt::Debug,
 {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "Json: {:?}", self.0)
     }
 }
@@ -115,7 +116,7 @@ impl<T> fmt::Display for Json<T>
 where
     T: fmt::Display,
 {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         fmt::Display::fmt(&self.0, f)
     }
 }
@@ -223,17 +224,18 @@ where
 ///
 /// fn main() {
 ///     let app = App::new().service(
-///         web::resource("/index.html").data(
-///             // change json extractor configuration
-///             web::Json::<Info>::configure(|cfg| {
-///                 cfg.limit(4096)
-///                    .content_type(|mime| {  // <- accept text/plain content type
-///                         mime.type_() == mime::TEXT && mime.subtype() == mime::PLAIN
-///                    })
-///                    .error_handler(|err, req| {  // <- create custom error response
-///                         error::InternalError::from_response(
-///                             err, HttpResponse::Conflict().finish()).into()
-///                    })
+///         web::resource("/index.html")
+///             .app_data(
+///                 // change json extractor configuration
+///                 web::Json::<Info>::configure(|cfg| {
+///                     cfg.limit(4096)
+///                        .content_type(|mime| {  // <- accept text/plain content type
+///                            mime.type_() == mime::TEXT && mime.subtype() == mime::PLAIN
+///                        })
+///                        .error_handler(|err, req| {  // <- create custom error response
+///                           error::InternalError::from_response(
+///                               err, HttpResponse::Conflict().finish()).into()
+///                        })
 ///             }))
 ///             .route(web::post().to(index))
 ///     );
@@ -293,7 +295,10 @@ impl Default for JsonConfig {
 pub struct JsonBody<U> {
     limit: usize,
     length: Option<usize>,
+    #[cfg(feature = "compress")]
     stream: Option<Decompress<Payload>>,
+    #[cfg(not(feature = "compress"))]
+    stream: Option<Payload>,
     err: Option<JsonPayloadError>,
     fut: Option<LocalBoxFuture<'static, Result<U, JsonPayloadError>>>,
 }
@@ -332,7 +337,11 @@ where
             .get(&CONTENT_LENGTH)
             .and_then(|l| l.to_str().ok())
             .and_then(|s| s.parse::<usize>().ok());
+
+        #[cfg(feature = "compress")]
         let payload = Decompress::from_headers(payload.take(), req.headers());
+        #[cfg(not(feature = "compress"))]
+        let payload = payload.take();
 
         JsonBody {
             limit: 262_144,
@@ -356,7 +365,7 @@ where
 {
     type Output = Result<U, JsonPayloadError>;
 
-    fn poll(mut self: Pin<&mut Self>, cx: &mut Context) -> Poll<Self::Output> {
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         if let Some(ref mut fut) = self.fut {
             return Pin::new(fut).poll(cx);
         }
@@ -387,7 +396,7 @@ where
                 }
                 Ok(serde_json::from_slice::<U>(&body)?)
             }
-                .boxed_local(),
+            .boxed_local(),
         );
 
         self.poll(cx)
@@ -454,7 +463,7 @@ mod tests {
                 header::HeaderValue::from_static("16"),
             )
             .set_payload(Bytes::from_static(b"{\"name\": \"test\"}"))
-            .data(JsonConfig::default().limit(10).error_handler(|err, _| {
+            .app_data(JsonConfig::default().limit(10).error_handler(|err, _| {
                 let msg = MyObject {
                     name: "invalid request".to_string(),
                 };
@@ -506,7 +515,7 @@ mod tests {
                 header::HeaderValue::from_static("16"),
             )
             .set_payload(Bytes::from_static(b"{\"name\": \"test\"}"))
-            .data(JsonConfig::default().limit(10))
+            .app_data(JsonConfig::default().limit(10))
             .to_http_parts();
 
         let s = Json::<MyObject>::from_request(&req, &mut pl).await;
@@ -523,7 +532,7 @@ mod tests {
                 header::HeaderValue::from_static("16"),
             )
             .set_payload(Bytes::from_static(b"{\"name\": \"test\"}"))
-            .data(
+            .app_data(
                 JsonConfig::default()
                     .limit(10)
                     .error_handler(|_, _| JsonPayloadError::ContentType.into()),
@@ -596,7 +605,7 @@ mod tests {
             header::HeaderValue::from_static("16"),
         )
         .set_payload(Bytes::from_static(b"{\"name\": \"test\"}"))
-        .data(JsonConfig::default().limit(4096))
+        .app_data(JsonConfig::default().limit(4096))
         .to_http_parts();
 
         let s = Json::<MyObject>::from_request(&req, &mut pl).await;
@@ -614,7 +623,7 @@ mod tests {
             header::HeaderValue::from_static("16"),
         )
         .set_payload(Bytes::from_static(b"{\"name\": \"test\"}"))
-        .data(JsonConfig::default().content_type(|mime: mime::Mime| {
+        .app_data(JsonConfig::default().content_type(|mime: mime::Mime| {
             mime.type_() == mime::TEXT && mime.subtype() == mime::PLAIN
         }))
         .to_http_parts();
@@ -634,7 +643,7 @@ mod tests {
             header::HeaderValue::from_static("16"),
         )
         .set_payload(Bytes::from_static(b"{\"name\": \"test\"}"))
-        .data(JsonConfig::default().content_type(|mime: mime::Mime| {
+        .app_data(JsonConfig::default().content_type(|mime: mime::Mime| {
             mime.type_() == mime::TEXT && mime.subtype() == mime::PLAIN
         }))
         .to_http_parts();

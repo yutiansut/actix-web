@@ -6,10 +6,10 @@ use actix_codec::{AsyncRead, AsyncWrite};
 use actix_connect::{
     default_connector, Connect as TcpConnect, Connection as TcpConnection,
 };
+use actix_rt::net::TcpStream;
 use actix_service::{apply_fn, Service};
 use actix_utils::timeout::{TimeoutError, TimeoutService};
 use http::Uri;
-use tokio_net::tcp::TcpStream;
 
 use super::connection::Connection;
 use super::error::ConnectError;
@@ -17,10 +17,10 @@ use super::pool::{ConnectionPool, Protocol};
 use super::Connect;
 
 #[cfg(feature = "openssl")]
-use open_ssl::ssl::SslConnector as OpensslConnector;
+use actix_connect::ssl::openssl::SslConnector as OpensslConnector;
 
 #[cfg(feature = "rustls")]
-use rust_tls::ClientConfig;
+use actix_connect::ssl::rustls::ClientConfig;
 #[cfg(feature = "rustls")]
 use std::sync::Arc;
 
@@ -62,7 +62,7 @@ trait Io: AsyncRead + AsyncWrite + Unpin {}
 impl<T: AsyncRead + AsyncWrite + Unpin> Io for T {}
 
 impl Connector<(), ()> {
-    #[allow(clippy::new_ret_no_self)]
+    #[allow(clippy::new_ret_no_self, clippy::let_unit_value)]
     pub fn new() -> Connector<
         impl Service<
                 Request = TcpConnect<Uri>,
@@ -74,7 +74,7 @@ impl Connector<(), ()> {
         let ssl = {
             #[cfg(feature = "openssl")]
             {
-                use open_ssl::ssl::SslMethod;
+                use actix_connect::ssl::openssl::SslMethod;
 
                 let mut ssl = OpensslConnector::builder(SslMethod::tls()).unwrap();
                 let _ = ssl
@@ -89,7 +89,7 @@ impl Connector<(), ()> {
                 config.set_protocols(&protos);
                 config
                     .root_store
-                    .add_server_trust_anchors(&webpki_roots::TLS_SERVER_ROOTS);
+                    .add_server_trust_anchors(&actix_tls::rustls::TLS_SERVER_ROOTS);
                 SslConnector::Rustls(Arc::new(config))
             }
             #[cfg(not(any(feature = "openssl", feature = "rustls")))]
@@ -242,12 +242,10 @@ where
         {
             const H2: &[u8] = b"h2";
             #[cfg(feature = "openssl")]
-            use actix_connect::ssl::OpensslConnector;
+            use actix_connect::ssl::openssl::OpensslConnector;
             #[cfg(feature = "rustls")]
-            use actix_connect::ssl::RustlsConnector;
+            use actix_connect::ssl::rustls::{RustlsConnector, Session};
             use actix_service::{boxed::service, pipeline};
-            #[cfg(feature = "rustls")]
-            use rust_tls::Session;
 
             let ssl_service = TimeoutService::new(
                 self.timeout,
@@ -339,7 +337,7 @@ where
 mod connect_impl {
     use std::task::{Context, Poll};
 
-    use futures::future::{err, Either, Ready};
+    use futures_util::future::{err, Either, Ready};
 
     use super::*;
     use crate::client::connection::IoConnection;
@@ -380,7 +378,7 @@ mod connect_impl {
             Ready<Result<IoConnection<Io>, ConnectError>>,
         >;
 
-        fn poll_ready(&mut self, cx: &mut Context) -> Poll<Result<(), Self::Error>> {
+        fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
             self.tcp_pool.poll_ready(cx)
         }
 
@@ -402,8 +400,8 @@ mod connect_impl {
     use std::pin::Pin;
     use std::task::{Context, Poll};
 
-    use futures::future::Either;
-    use futures::ready;
+    use futures_core::ready;
+    use futures_util::future::Either;
 
     use super::*;
     use crate::client::connection::EitherConnection;
@@ -453,7 +451,7 @@ mod connect_impl {
             InnerConnectorResponseB<T2, Io1, Io2>,
         >;
 
-        fn poll_ready(&mut self, cx: &mut Context) -> Poll<Result<(), Self::Error>> {
+        fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
             self.tcp_pool.poll_ready(cx)
         }
 
@@ -492,10 +490,10 @@ mod connect_impl {
     {
         type Output = Result<EitherConnection<Io1, Io2>, ConnectError>;
 
-        fn poll(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Self::Output> {
+        fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
             Poll::Ready(
                 ready!(Pin::new(&mut self.get_mut().fut).poll(cx))
-                    .map(|res| EitherConnection::A(res)),
+                    .map(EitherConnection::A),
             )
         }
     }
@@ -521,10 +519,10 @@ mod connect_impl {
     {
         type Output = Result<EitherConnection<Io1, Io2>, ConnectError>;
 
-        fn poll(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Self::Output> {
+        fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
             Poll::Ready(
                 ready!(Pin::new(&mut self.get_mut().fut).poll(cx))
-                    .map(|res| EitherConnection::B(res)),
+                    .map(EitherConnection::B),
             )
         }
     }

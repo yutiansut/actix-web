@@ -5,6 +5,7 @@ use std::marker::PhantomData;
 use std::rc::Rc;
 
 use actix_http::body::{Body, MessageBody};
+use actix_http::Extensions;
 use actix_service::boxed::{self, BoxServiceFactory};
 use actix_service::{
     apply, apply_fn_factory, IntoServiceFactory, ServiceFactory, Transform,
@@ -12,7 +13,7 @@ use actix_service::{
 use futures::future::{FutureExt, LocalBoxFuture};
 
 use crate::app_service::{AppEntry, AppInit, AppRoutingFactory};
-use crate::config::{AppConfig, AppConfigInner, ServiceConfig};
+use crate::config::ServiceConfig;
 use crate::data::{Data, DataFactory};
 use crate::dev::ResourceDef;
 use crate::error::Error;
@@ -36,9 +37,9 @@ pub struct App<T, B> {
     factory_ref: Rc<RefCell<Option<AppRoutingFactory>>>,
     data: Vec<Box<dyn DataFactory>>,
     data_factories: Vec<FnDataFactory>,
-    config: AppConfigInner,
     external: Vec<ResourceDef>,
-    _t: PhantomData<(B)>,
+    extensions: Extensions,
+    _t: PhantomData<B>,
 }
 
 impl App<AppEntry, Body> {
@@ -52,8 +53,8 @@ impl App<AppEntry, Body> {
             services: Vec::new(),
             default: None,
             factory_ref: fref,
-            config: AppConfigInner::default(),
             external: Vec::new(),
+            extensions: Extensions::new(),
             _t: PhantomData,
         }
     }
@@ -77,8 +78,9 @@ where
     /// an application instance. Http server constructs an application
     /// instance for each thread, thus application data must be constructed
     /// multiple times. If you want to share data between different
-    /// threads, a shared object should be used, e.g. `Arc`. Application
-    /// data does not need to be `Send` or `Sync`.
+    /// threads, a shared object should be used, e.g. `Arc`. Internally `Data` type
+    /// uses `Arc` so data could be created outside of app factory and clones could
+    /// be stored via `App::app_data()` method.
     ///
     /// ```rust
     /// use std::cell::Cell;
@@ -93,13 +95,11 @@ where
     ///     HttpResponse::Ok()
     /// }
     ///
-    /// fn main() {
-    ///     let app = App::new()
-    ///         .data(MyData{ counter: Cell::new(0) })
-    ///         .service(
-    ///             web::resource("/index.html").route(
-    ///                 web::get().to(index)));
-    /// }
+    /// let app = App::new()
+    ///     .data(MyData{ counter: Cell::new(0) })
+    ///     .service(
+    ///         web::resource("/index.html").route(
+    ///             web::get().to(index)));
     /// ```
     pub fn data<U: 'static>(mut self, data: U) -> Self {
         self.data.push(Box::new(Data::new(data)));
@@ -137,10 +137,15 @@ where
         self
     }
 
-    /// Set application data. Application data could be accessed
-    /// by using `Data<T>` extractor where `T` is data type.
-    pub fn register_data<U: 'static>(mut self, data: Data<U>) -> Self {
-        self.data.push(Box::new(data));
+    /// Set application level arbitrary data item.
+    ///
+    /// Application data stored with `App::app_data()` method is available
+    /// via `HttpRequest::app_data()` method at runtime.
+    ///
+    /// This method could be used for storing `Data<T>` as well, in that case
+    /// data could be accessed by using `Data<T>` extractor.
+    pub fn app_data<U: 'static>(mut self, ext: U) -> Self {
+        self.extensions.insert(ext);
         self
     }
 
@@ -224,18 +229,6 @@ where
     {
         self.services
             .push(Box::new(ServiceFactoryWrapper::new(factory)));
-        self
-    }
-
-    /// Set server host name.
-    ///
-    /// Host name is used by application router as a hostname for url
-    /// generation. Check [ConnectionInfo](./dev/struct.ConnectionInfo.
-    /// html#method.host) documentation for more information.
-    ///
-    /// By default host name is set to a "localhost" value.
-    pub fn hostname(mut self, val: &str) -> Self {
-        self.config.host = val.to_owned();
         self
     }
 
@@ -385,8 +378,8 @@ where
             services: self.services,
             default: self.default,
             factory_ref: self.factory_ref,
-            config: self.config,
             external: self.external,
+            extensions: self.extensions,
             _t: PhantomData,
         }
     }
@@ -447,8 +440,8 @@ where
             services: self.services,
             default: self.default,
             factory_ref: self.factory_ref,
-            config: self.config,
             external: self.external,
+            extensions: self.extensions,
             _t: PhantomData,
         }
     }
@@ -474,7 +467,7 @@ where
             external: RefCell::new(self.external),
             default: self.default,
             factory_ref: self.factory_ref,
-            config: RefCell::new(AppConfig(Rc::new(self.config))),
+            extensions: RefCell::new(Some(self.extensions)),
         }
     }
 }
@@ -556,6 +549,20 @@ mod tests {
         let req = TestRequest::default().to_request();
         let resp = srv.call(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[actix_rt::test]
+    async fn test_extension() {
+        let mut srv = init_service(App::new().app_data(10usize).service(
+            web::resource("/").to(|req: HttpRequest| {
+                assert_eq!(*req.app_data::<usize>().unwrap(), 10);
+                HttpResponse::Ok()
+            }),
+        ))
+        .await;
+        let req = TestRequest::default().to_request();
+        let resp = srv.call(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
     }
 
     #[actix_rt::test]

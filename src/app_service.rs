@@ -7,9 +7,8 @@ use std::task::{Context, Poll};
 
 use actix_http::{Extensions, Request, Response};
 use actix_router::{Path, ResourceDef, ResourceInfo, Router, Url};
-use actix_server_config::ServerConfig;
 use actix_service::boxed::{self, BoxService, BoxServiceFactory};
-use actix_service::{service_fn, Service, ServiceFactory};
+use actix_service::{fn_service, Service, ServiceFactory};
 use futures::future::{ok, FutureExt, LocalBoxFuture};
 
 use crate::config::{AppConfig, AppService};
@@ -40,9 +39,9 @@ where
     >,
 {
     pub(crate) endpoint: T,
+    pub(crate) extensions: RefCell<Option<Extensions>>,
     pub(crate) data: Rc<Vec<Box<dyn DataFactory>>>,
     pub(crate) data_factories: Rc<Vec<FnDataFactory>>,
-    pub(crate) config: RefCell<AppConfig>,
     pub(crate) services: Rc<RefCell<Vec<Box<dyn AppServiceFactory>>>>,
     pub(crate) default: Option<Rc<HttpNewService>>,
     pub(crate) factory_ref: Rc<RefCell<Option<AppRoutingFactory>>>,
@@ -59,7 +58,7 @@ where
         InitError = (),
     >,
 {
-    type Config = ServerConfig;
+    type Config = AppConfig;
     type Request = Request;
     type Response = ServiceResponse<B>;
     type Error = T::Error;
@@ -67,27 +66,16 @@ where
     type Service = AppInitService<T::Service, B>;
     type Future = AppInitResult<T, B>;
 
-    fn new_service(&self, cfg: &ServerConfig) -> Self::Future {
+    fn new_service(&self, config: AppConfig) -> Self::Future {
         // update resource default service
         let default = self.default.clone().unwrap_or_else(|| {
-            Rc::new(boxed::factory(service_fn(|req: ServiceRequest| {
+            Rc::new(boxed::factory(fn_service(|req: ServiceRequest| {
                 ok(req.into_response(Response::NotFound().finish()))
             })))
         });
 
         // App config
-        {
-            let mut c = self.config.borrow_mut();
-            let loc_cfg = Rc::get_mut(&mut c.0).unwrap();
-            loc_cfg.secure = cfg.secure();
-            loc_cfg.addr = cfg.local_addr();
-        }
-
-        let mut config = AppService::new(
-            self.config.borrow().clone(),
-            default.clone(),
-            self.data.clone(),
-        );
+        let mut config = AppService::new(config, default.clone(), self.data.clone());
 
         // register services
         std::mem::replace(&mut *self.services.borrow_mut(), Vec::new())
@@ -123,10 +111,16 @@ where
 
         AppInitResult {
             endpoint: None,
-            endpoint_fut: self.endpoint.new_service(&()),
+            endpoint_fut: self.endpoint.new_service(()),
             data: self.data.clone(),
             data_factories: Vec::new(),
             data_factories_fut: self.data_factories.iter().map(|f| f()).collect(),
+            extensions: Some(
+                self.extensions
+                    .borrow_mut()
+                    .take()
+                    .unwrap_or_else(Extensions::new),
+            ),
             config,
             rmap,
             _t: PhantomData,
@@ -147,6 +141,7 @@ where
     data: Rc<Vec<Box<dyn DataFactory>>>,
     data_factories: Vec<Box<dyn DataFactory>>,
     data_factories_fut: Vec<LocalBoxFuture<'static, Result<Box<dyn DataFactory>, ()>>>,
+    extensions: Option<Extensions>,
     _t: PhantomData<B>,
 }
 
@@ -162,7 +157,7 @@ where
 {
     type Output = Result<AppInitService<T::Service, B>, ()>;
 
-    fn poll(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Self::Output> {
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.project();
 
         // async data factories
@@ -185,7 +180,7 @@ where
 
         if this.endpoint.is_some() && this.data_factories_fut.is_empty() {
             // create app data container
-            let mut data = Extensions::new();
+            let mut data = this.extensions.take().unwrap();
             for f in this.data.iter() {
                 f.create(&mut data);
             }
@@ -228,7 +223,7 @@ where
     type Error = T::Error;
     type Future = T::Future;
 
-    fn poll_ready(&mut self, cx: &mut Context) -> Poll<Result<(), Self::Error>> {
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         self.service.poll_ready(cx)
     }
 
@@ -281,7 +276,7 @@ impl ServiceFactory for AppRoutingFactory {
     type Service = AppRouting;
     type Future = AppRoutingFactoryResponse;
 
-    fn new_service(&self, _: &()) -> Self::Future {
+    fn new_service(&self, _: ()) -> Self::Future {
         AppRoutingFactoryResponse {
             fut: self
                 .services
@@ -290,12 +285,12 @@ impl ServiceFactory for AppRoutingFactory {
                     CreateAppRoutingItem::Future(
                         Some(path.clone()),
                         guards.borrow_mut().take(),
-                        service.new_service(&()).boxed_local(),
+                        service.new_service(()).boxed_local(),
                     )
                 })
                 .collect(),
             default: None,
-            default_fut: Some(self.default.new_service(&())),
+            default_fut: Some(self.default.new_service(())),
         }
     }
 }
@@ -318,7 +313,7 @@ enum CreateAppRoutingItem {
 impl Future for AppRoutingFactoryResponse {
     type Output = Result<AppRouting, ()>;
 
-    fn poll(mut self: Pin<&mut Self>, cx: &mut Context) -> Poll<Self::Output> {
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let mut done = true;
 
         if let Some(ref mut fut) = self.default_fut {
@@ -389,7 +384,7 @@ impl Service for AppRouting {
     type Error = Error;
     type Future = BoxResponse;
 
-    fn poll_ready(&mut self, _: &mut Context) -> Poll<Result<(), Self::Error>> {
+    fn poll_ready(&mut self, _: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         if self.ready.is_none() {
             Poll::Ready(Ok(()))
         } else {
@@ -440,8 +435,8 @@ impl ServiceFactory for AppEntry {
     type Service = AppRouting;
     type Future = AppRoutingFactoryResponse;
 
-    fn new_service(&self, _: &()) -> Self::Future {
-        self.factory.borrow_mut().as_mut().unwrap().new_service(&())
+    fn new_service(&self, _: ()) -> Self::Future {
+        self.factory.borrow_mut().as_mut().unwrap().new_service(())
     }
 }
 

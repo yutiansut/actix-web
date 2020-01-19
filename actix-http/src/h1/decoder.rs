@@ -1,12 +1,13 @@
+use std::convert::TryFrom;
 use std::io;
 use std::marker::PhantomData;
 use std::mem::MaybeUninit;
 use std::task::Poll;
 
 use actix_codec::Decoder;
-use bytes::{Bytes, BytesMut};
+use bytes::{Buf, Bytes, BytesMut};
 use http::header::{HeaderName, HeaderValue};
-use http::{header, HttpTryFrom, Method, StatusCode, Uri, Version};
+use http::{header, Method, StatusCode, Uri, Version};
 use httparse;
 use log::{debug, error, trace};
 
@@ -79,8 +80,8 @@ pub(crate) trait MessageType: Sized {
 
                 // Unsafe: httparse check header value for valid utf-8
                 let value = unsafe {
-                    HeaderValue::from_shared_unchecked(
-                        slice.slice(idx.value.0, idx.value.1),
+                    HeaderValue::from_maybe_shared_unchecked(
+                        slice.slice(idx.value.0..idx.value.1),
                     )
                 };
                 match name {
@@ -184,6 +185,7 @@ impl MessageType for Request {
         &mut self.head_mut().headers
     }
 
+    #[allow(clippy::uninit_assumed_init)]
     fn decode(src: &mut BytesMut) -> Result<Option<(Self, PayloadType)>, ParseError> {
         // Unsafe: we read only this data only after httparse parses headers into.
         // performance bump for pipeline benchmarks.
@@ -191,7 +193,7 @@ impl MessageType for Request {
             unsafe { MaybeUninit::uninit().assume_init() };
 
         let (len, method, uri, ver, h_len) = {
-            let mut parsed: [httparse::Header; MAX_HEADERS] =
+            let mut parsed: [httparse::Header<'_>; MAX_HEADERS] =
                 unsafe { MaybeUninit::uninit().assume_init() };
 
             let mut req = httparse::Request::new(&mut parsed);
@@ -259,6 +261,7 @@ impl MessageType for ResponseHead {
         &mut self.headers
     }
 
+    #[allow(clippy::uninit_assumed_init)]
     fn decode(src: &mut BytesMut) -> Result<Option<(Self, PayloadType)>, ParseError> {
         // Unsafe: we read only this data only after httparse parses headers into.
         // performance bump for pipeline benchmarks.
@@ -266,7 +269,7 @@ impl MessageType for ResponseHead {
             unsafe { MaybeUninit::uninit().assume_init() };
 
         let (len, ver, status, h_len) = {
-            let mut parsed: [httparse::Header; MAX_HEADERS] =
+            let mut parsed: [httparse::Header<'_>; MAX_HEADERS] =
                 unsafe { MaybeUninit::uninit().assume_init() };
 
             let mut res = httparse::Response::new(&mut parsed);
@@ -325,7 +328,7 @@ pub(crate) struct HeaderIndex {
 impl HeaderIndex {
     pub(crate) fn record(
         bytes: &[u8],
-        headers: &[httparse::Header],
+        headers: &[httparse::Header<'_>],
         indices: &mut [HeaderIndex],
     ) {
         let bytes_ptr = bytes.as_ptr() as usize;
@@ -428,7 +431,7 @@ impl Decoder for PayloadDecoder {
                     let len = src.len() as u64;
                     let buf;
                     if *remaining > len {
-                        buf = src.take().freeze();
+                        buf = src.split().freeze();
                         *remaining -= len;
                     } else {
                         buf = src.split_to(*remaining as usize).freeze();
@@ -463,7 +466,7 @@ impl Decoder for PayloadDecoder {
                 if src.is_empty() {
                     Ok(None)
                 } else {
-                    Ok(Some(PayloadItem::Chunk(src.take().freeze())))
+                    Ok(Some(PayloadItem::Chunk(src.split().freeze())))
                 }
             }
         }
@@ -474,7 +477,7 @@ macro_rules! byte (
     ($rdr:ident) => ({
         if $rdr.len() > 0 {
             let b = $rdr[0];
-            $rdr.split_to(1);
+            $rdr.advance(1);
             b
         } else {
             return Poll::Pending
@@ -581,7 +584,7 @@ impl ChunkedState {
         } else {
             let slice;
             if *rem > len {
-                slice = rdr.take().freeze();
+                slice = rdr.split().freeze();
                 *rem -= len;
             } else {
                 slice = rdr.split_to(*rem as usize).freeze();

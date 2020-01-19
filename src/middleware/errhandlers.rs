@@ -4,7 +4,7 @@ use std::task::{Context, Poll};
 
 use actix_service::{Service, Transform};
 use futures::future::{ok, FutureExt, LocalBoxFuture, Ready};
-use hashbrown::HashMap;
+use fxhash::FxHashMap;
 
 use crate::dev::{ServiceRequest, ServiceResponse};
 use crate::error::{Error, Result};
@@ -52,13 +52,13 @@ type ErrorHandler<B> = dyn Fn(ServiceResponse<B>) -> Result<ErrorHandlerResponse
 /// # }
 /// ```
 pub struct ErrorHandlers<B> {
-    handlers: Rc<HashMap<StatusCode, Box<ErrorHandler<B>>>>,
+    handlers: Rc<FxHashMap<StatusCode, Box<ErrorHandler<B>>>>,
 }
 
 impl<B> Default for ErrorHandlers<B> {
     fn default() -> Self {
         ErrorHandlers {
-            handlers: Rc::new(HashMap::new()),
+            handlers: Rc::new(FxHashMap::default()),
         }
     }
 }
@@ -105,7 +105,7 @@ where
 #[doc(hidden)]
 pub struct ErrorHandlersMiddleware<S, B> {
     service: S,
-    handlers: Rc<HashMap<StatusCode, Box<ErrorHandler<B>>>>,
+    handlers: Rc<FxHashMap<StatusCode, Box<ErrorHandler<B>>>>,
 }
 
 impl<S, B> Service for ErrorHandlersMiddleware<S, B>
@@ -119,7 +119,7 @@ where
     type Error = Error;
     type Future = LocalBoxFuture<'static, Result<Self::Response, Self::Error>>;
 
-    fn poll_ready(&mut self, cx: &mut Context) -> Poll<Result<(), Self::Error>> {
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         self.service.poll_ready(cx)
     }
 
@@ -140,7 +140,7 @@ where
                 Ok(res)
             }
         }
-            .boxed_local()
+        .boxed_local()
     }
 }
 

@@ -19,6 +19,8 @@ use crate::request::HttpRequest;
 /// be decoded into any type which depends upon data ordering e.g. tuples or tuple-structs.
 /// Attempts to do so will *fail at runtime*.
 ///
+/// [**QueryConfig**](struct.QueryConfig.html) allows to configure extraction process.
+///
 /// ## Example
 ///
 /// ```rust
@@ -84,13 +86,13 @@ impl<T> ops::DerefMut for Query<T> {
 }
 
 impl<T: fmt::Debug> fmt::Debug for Query<T> {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         self.0.fmt(f)
     }
 }
 
 impl<T: fmt::Display> fmt::Display for Query<T> {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         self.0.fmt(f)
     }
 }
@@ -185,7 +187,7 @@ where
 ///
 /// fn main() {
 ///     let app = App::new().service(
-///         web::resource("/index.html").data(
+///         web::resource("/index.html").app_data(
 ///             // change query extractor configuration
 ///             web::Query::<Info>::configure(|cfg| {
 ///                 cfg.error_handler(|err, req| {  // <- create custom error response
@@ -273,7 +275,7 @@ mod tests {
     #[actix_rt::test]
     async fn test_custom_error_responder() {
         let req = TestRequest::with_uri("/name/user1/")
-            .data(QueryConfig::default().error_handler(|e, _| {
+            .app_data(QueryConfig::default().error_handler(|e, _| {
                 let resp = HttpResponse::UnprocessableEntity().finish();
                 InternalError::from_response(e, resp).into()
             }))

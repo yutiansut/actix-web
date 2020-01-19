@@ -1,25 +1,35 @@
 //! Various helpers for Actix applications to use during testing.
+use std::convert::TryFrom;
+use std::net::SocketAddr;
 use std::rc::Rc;
+use std::sync::mpsc;
+use std::{fmt, net, thread, time};
 
+use actix_codec::{AsyncRead, AsyncWrite, Framed};
 use actix_http::http::header::{ContentType, Header, HeaderName, IntoHeaderValue};
-use actix_http::http::{HttpTryFrom, Method, StatusCode, Uri, Version};
+use actix_http::http::{Error as HttpError, Method, StatusCode, Uri, Version};
 use actix_http::test::TestRequest as HttpTestRequest;
-use actix_http::{cookie::Cookie, Extensions, Request};
+use actix_http::{cookie::Cookie, ws, Extensions, HttpService, Request};
 use actix_router::{Path, ResourceDef, Url};
-use actix_server_config::ServerConfig;
-use actix_service::{IntoService, IntoServiceFactory, Service, ServiceFactory};
+use actix_rt::{time::delay_for, System};
+use actix_service::{
+    map_config, IntoService, IntoServiceFactory, Service, ServiceFactory,
+};
+use awc::error::PayloadError;
+use awc::{Client, ClientRequest, ClientResponse, Connector};
 use bytes::{Bytes, BytesMut};
 use futures::future::ok;
 use futures::stream::{Stream, StreamExt};
+use net2::TcpBuilder;
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 use serde_json;
 
 pub use actix_http::test::TestBuffer;
 
-use crate::config::{AppConfig, AppConfigInner};
+use crate::config::AppConfig;
 use crate::data::Data;
-use crate::dev::{Body, MessageBody, Payload};
+use crate::dev::{Body, MessageBody, Payload, Server};
 use crate::request::HttpRequestPool;
 use crate::rmap::ResourceMap;
 use crate::service::{ServiceRequest, ServiceResponse};
@@ -55,7 +65,7 @@ pub fn default_service(
 ///     let mut app = test::init_service(
 ///         App::new()
 ///             .service(web::resource("/test").to(|| async { HttpResponse::Ok() }))
-///     );
+///     ).await;
 ///
 ///     // Create request object
 ///     let req = test::TestRequest::with_uri("/test").to_request();
@@ -71,16 +81,15 @@ pub async fn init_service<R, S, B, E>(
 where
     R: IntoServiceFactory<S>,
     S: ServiceFactory<
-        Config = ServerConfig,
+        Config = AppConfig,
         Request = Request,
         Response = ServiceResponse<B>,
         Error = E,
     >,
     S::InitError: std::fmt::Debug,
 {
-    let cfg = ServerConfig::new("127.0.0.1:8080".parse().unwrap());
     let srv = app.into_factory();
-    srv.new_service(&cfg).await.unwrap()
+    srv.new_service(AppConfig::default()).await.unwrap()
 }
 
 /// Calls service and waits for response future completion.
@@ -289,8 +298,9 @@ where
 pub struct TestRequest {
     req: HttpTestRequest,
     rmap: ResourceMap,
-    config: AppConfigInner,
+    config: AppConfig,
     path: Path<Url>,
+    peer_addr: Option<SocketAddr>,
     app_data: Extensions,
 }
 
@@ -299,8 +309,9 @@ impl Default for TestRequest {
         TestRequest {
             req: HttpTestRequest::default(),
             rmap: ResourceMap::new(ResourceDef::new("")),
-            config: AppConfigInner::default(),
+            config: AppConfig::default(),
             path: Path::new(Url::new(Uri::default())),
+            peer_addr: None,
             app_data: Extensions::new(),
         }
     }
@@ -321,7 +332,8 @@ impl TestRequest {
     /// Create TestRequest and set header
     pub fn with_header<K, V>(key: K, value: V) -> TestRequest
     where
-        HeaderName: HttpTryFrom<K>,
+        HeaderName: TryFrom<K>,
+        <HeaderName as TryFrom<K>>::Error: Into<HttpError>,
         V: IntoHeaderValue,
     {
         TestRequest::default().header(key, value)
@@ -379,7 +391,8 @@ impl TestRequest {
     /// Set a header
     pub fn header<K, V>(mut self, key: K, value: V) -> Self
     where
-        HeaderName: HttpTryFrom<K>,
+        HeaderName: TryFrom<K>,
+        <HeaderName as TryFrom<K>>::Error: Into<HttpError>,
         V: IntoHeaderValue,
     {
         self.req.header(key, value);
@@ -387,7 +400,7 @@ impl TestRequest {
     }
 
     /// Set cookie for this request
-    pub fn cookie(mut self, cookie: Cookie) -> Self {
+    pub fn cookie(mut self, cookie: Cookie<'_>) -> Self {
         self.req.cookie(cookie);
         self
     }
@@ -395,6 +408,12 @@ impl TestRequest {
     /// Set request path pattern parameter
     pub fn param(mut self, name: &'static str, value: &'static str) -> Self {
         self.path.add_static(name, value);
+        self
+    }
+
+    /// Set peer addr
+    pub fn peer_addr(mut self, addr: SocketAddr) -> Self {
+        self.peer_addr = Some(addr);
         self
     }
 
@@ -431,6 +450,13 @@ impl TestRequest {
         self
     }
 
+    /// Set application data. This is equivalent of `App::app_data()` method
+    /// for testing purpose.
+    pub fn app_data<T: 'static>(mut self, data: T) -> Self {
+        self.app_data.insert(data);
+        self
+    }
+
     #[cfg(test)]
     /// Set request config
     pub(crate) fn rmap(mut self, rmap: ResourceMap) -> Self {
@@ -440,12 +466,15 @@ impl TestRequest {
 
     /// Complete request creation and generate `Request` instance
     pub fn to_request(mut self) -> Request {
-        self.req.finish()
+        let mut req = self.req.finish();
+        req.head_mut().peer_addr = self.peer_addr;
+        req
     }
 
     /// Complete request creation and generate `ServiceRequest` instance
     pub fn to_srv_request(mut self) -> ServiceRequest {
-        let (head, payload) = self.req.finish().into_parts();
+        let (mut head, payload) = self.req.finish().into_parts();
+        head.peer_addr = self.peer_addr;
         self.path.get_mut().update(&head.uri);
 
         ServiceRequest::new(HttpRequest::new(
@@ -453,7 +482,7 @@ impl TestRequest {
             head,
             payload,
             Rc::new(self.rmap),
-            AppConfig::new(self.config),
+            self.config.clone(),
             Rc::new(self.app_data),
             HttpRequestPool::create(),
         ))
@@ -466,7 +495,8 @@ impl TestRequest {
 
     /// Complete request creation and generate `HttpRequest` instance
     pub fn to_http_request(mut self) -> HttpRequest {
-        let (head, payload) = self.req.finish().into_parts();
+        let (mut head, payload) = self.req.finish().into_parts();
+        head.peer_addr = self.peer_addr;
         self.path.get_mut().update(&head.uri);
 
         HttpRequest::new(
@@ -474,7 +504,7 @@ impl TestRequest {
             head,
             payload,
             Rc::new(self.rmap),
-            AppConfig::new(self.config),
+            self.config.clone(),
             Rc::new(self.app_data),
             HttpRequestPool::create(),
         )
@@ -482,7 +512,8 @@ impl TestRequest {
 
     /// Complete request creation and generate `HttpRequest` and `Payload` instances
     pub fn to_http_parts(mut self) -> (HttpRequest, Payload) {
-        let (head, payload) = self.req.finish().into_parts();
+        let (mut head, payload) = self.req.finish().into_parts();
+        head.peer_addr = self.peer_addr;
         self.path.get_mut().update(&head.uri);
 
         let req = HttpRequest::new(
@@ -490,7 +521,7 @@ impl TestRequest {
             head,
             Payload::None,
             Rc::new(self.rmap),
-            AppConfig::new(self.config),
+            self.config.clone(),
             Rc::new(self.app_data),
             HttpRequestPool::create(),
         );
@@ -499,14 +530,436 @@ impl TestRequest {
     }
 }
 
+/// Start test server with default configuration
+///
+/// Test server is very simple server that simplify process of writing
+/// integration tests cases for actix web applications.
+///
+/// # Examples
+///
+/// ```rust
+/// use actix_web::{web, test, App, HttpResponse, Error};
+///
+/// async fn my_handler() -> Result<HttpResponse, Error> {
+///     Ok(HttpResponse::Ok().into())
+/// }
+///
+/// #[actix_rt::test]
+/// async fn test_example() {
+///     let mut srv = test::start(
+///         || App::new().service(
+///                 web::resource("/").to(my_handler))
+///     );
+///
+///     let req = srv.get("/");
+///     let response = req.send().await.unwrap();
+///     assert!(response.status().is_success());
+/// }
+/// ```
+pub fn start<F, I, S, B>(factory: F) -> TestServer
+where
+    F: Fn() -> I + Send + Clone + 'static,
+    I: IntoServiceFactory<S>,
+    S: ServiceFactory<Config = AppConfig, Request = Request> + 'static,
+    S::Error: Into<Error> + 'static,
+    S::InitError: fmt::Debug,
+    S::Response: Into<HttpResponse<B>> + 'static,
+    <S::Service as Service>::Future: 'static,
+    B: MessageBody + 'static,
+{
+    start_with(TestServerConfig::default(), factory)
+}
+
+/// Start test server with custom configuration
+///
+/// Test server could be configured in different ways, for details check
+/// `TestServerConfig` docs.
+///
+/// # Examples
+///
+/// ```rust
+/// use actix_web::{web, test, App, HttpResponse, Error};
+///
+/// async fn my_handler() -> Result<HttpResponse, Error> {
+///     Ok(HttpResponse::Ok().into())
+/// }
+///
+/// #[actix_rt::test]
+/// async fn test_example() {
+///     let mut srv = test::start_with(test::config().h1(), ||
+///         App::new().service(web::resource("/").to(my_handler))
+///     );
+///
+///     let req = srv.get("/");
+///     let response = req.send().await.unwrap();
+///     assert!(response.status().is_success());
+/// }
+/// ```
+pub fn start_with<F, I, S, B>(cfg: TestServerConfig, factory: F) -> TestServer
+where
+    F: Fn() -> I + Send + Clone + 'static,
+    I: IntoServiceFactory<S>,
+    S: ServiceFactory<Config = AppConfig, Request = Request> + 'static,
+    S::Error: Into<Error> + 'static,
+    S::InitError: fmt::Debug,
+    S::Response: Into<HttpResponse<B>> + 'static,
+    <S::Service as Service>::Future: 'static,
+    B: MessageBody + 'static,
+{
+    let (tx, rx) = mpsc::channel();
+
+    let ssl = match cfg.stream {
+        StreamType::Tcp => false,
+        #[cfg(feature = "openssl")]
+        StreamType::Openssl(_) => true,
+        #[cfg(feature = "rustls")]
+        StreamType::Rustls(_) => true,
+    };
+
+    // run server in separate thread
+    thread::spawn(move || {
+        let sys = System::new("actix-test-server");
+        let tcp = net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let local_addr = tcp.local_addr().unwrap();
+        let factory = factory.clone();
+        let cfg = cfg.clone();
+        let ctimeout = cfg.client_timeout;
+        let builder = Server::build().workers(1).disable_signals();
+
+        let srv = match cfg.stream {
+            StreamType::Tcp => match cfg.tp {
+                HttpVer::Http1 => builder.listen("test", tcp, move || {
+                    let cfg =
+                        AppConfig::new(false, local_addr, format!("{}", local_addr));
+                    HttpService::build()
+                        .client_timeout(ctimeout)
+                        .h1(map_config(factory(), move |_| cfg.clone()))
+                        .tcp()
+                }),
+                HttpVer::Http2 => builder.listen("test", tcp, move || {
+                    let cfg =
+                        AppConfig::new(false, local_addr, format!("{}", local_addr));
+                    HttpService::build()
+                        .client_timeout(ctimeout)
+                        .h2(map_config(factory(), move |_| cfg.clone()))
+                        .tcp()
+                }),
+                HttpVer::Both => builder.listen("test", tcp, move || {
+                    let cfg =
+                        AppConfig::new(false, local_addr, format!("{}", local_addr));
+                    HttpService::build()
+                        .client_timeout(ctimeout)
+                        .finish(map_config(factory(), move |_| cfg.clone()))
+                        .tcp()
+                }),
+            },
+            #[cfg(feature = "openssl")]
+            StreamType::Openssl(acceptor) => match cfg.tp {
+                HttpVer::Http1 => builder.listen("test", tcp, move || {
+                    let cfg =
+                        AppConfig::new(true, local_addr, format!("{}", local_addr));
+                    HttpService::build()
+                        .client_timeout(ctimeout)
+                        .h1(map_config(factory(), move |_| cfg.clone()))
+                        .openssl(acceptor.clone())
+                }),
+                HttpVer::Http2 => builder.listen("test", tcp, move || {
+                    let cfg =
+                        AppConfig::new(true, local_addr, format!("{}", local_addr));
+                    HttpService::build()
+                        .client_timeout(ctimeout)
+                        .h2(map_config(factory(), move |_| cfg.clone()))
+                        .openssl(acceptor.clone())
+                }),
+                HttpVer::Both => builder.listen("test", tcp, move || {
+                    let cfg =
+                        AppConfig::new(true, local_addr, format!("{}", local_addr));
+                    HttpService::build()
+                        .client_timeout(ctimeout)
+                        .finish(map_config(factory(), move |_| cfg.clone()))
+                        .openssl(acceptor.clone())
+                }),
+            },
+            #[cfg(feature = "rustls")]
+            StreamType::Rustls(config) => match cfg.tp {
+                HttpVer::Http1 => builder.listen("test", tcp, move || {
+                    let cfg =
+                        AppConfig::new(true, local_addr, format!("{}", local_addr));
+                    HttpService::build()
+                        .client_timeout(ctimeout)
+                        .h1(map_config(factory(), move |_| cfg.clone()))
+                        .rustls(config.clone())
+                }),
+                HttpVer::Http2 => builder.listen("test", tcp, move || {
+                    let cfg =
+                        AppConfig::new(true, local_addr, format!("{}", local_addr));
+                    HttpService::build()
+                        .client_timeout(ctimeout)
+                        .h2(map_config(factory(), move |_| cfg.clone()))
+                        .rustls(config.clone())
+                }),
+                HttpVer::Both => builder.listen("test", tcp, move || {
+                    let cfg =
+                        AppConfig::new(true, local_addr, format!("{}", local_addr));
+                    HttpService::build()
+                        .client_timeout(ctimeout)
+                        .finish(map_config(factory(), move |_| cfg.clone()))
+                        .rustls(config.clone())
+                }),
+            },
+        }
+        .unwrap()
+        .start();
+
+        tx.send((System::current(), srv, local_addr)).unwrap();
+        sys.run()
+    });
+
+    let (system, server, addr) = rx.recv().unwrap();
+
+    let client = {
+        let connector = {
+            #[cfg(feature = "openssl")]
+            {
+                use open_ssl::ssl::{SslConnector, SslMethod, SslVerifyMode};
+
+                let mut builder = SslConnector::builder(SslMethod::tls()).unwrap();
+                builder.set_verify(SslVerifyMode::NONE);
+                let _ = builder
+                    .set_alpn_protos(b"\x02h2\x08http/1.1")
+                    .map_err(|e| log::error!("Can not set alpn protocol: {:?}", e));
+                Connector::new()
+                    .conn_lifetime(time::Duration::from_secs(0))
+                    .timeout(time::Duration::from_millis(30000))
+                    .ssl(builder.build())
+                    .finish()
+            }
+            #[cfg(not(feature = "openssl"))]
+            {
+                Connector::new()
+                    .conn_lifetime(time::Duration::from_secs(0))
+                    .timeout(time::Duration::from_millis(30000))
+                    .finish()
+            }
+        };
+
+        Client::build().connector(connector).finish()
+    };
+
+    TestServer {
+        ssl,
+        addr,
+        client,
+        system,
+        server,
+    }
+}
+
+#[derive(Clone)]
+pub struct TestServerConfig {
+    tp: HttpVer,
+    stream: StreamType,
+    client_timeout: u64,
+}
+
+#[derive(Clone)]
+enum HttpVer {
+    Http1,
+    Http2,
+    Both,
+}
+
+#[derive(Clone)]
+enum StreamType {
+    Tcp,
+    #[cfg(feature = "openssl")]
+    Openssl(open_ssl::ssl::SslAcceptor),
+    #[cfg(feature = "rustls")]
+    Rustls(rust_tls::ServerConfig),
+}
+
+impl Default for TestServerConfig {
+    fn default() -> Self {
+        TestServerConfig::new()
+    }
+}
+
+/// Create default test server config
+pub fn config() -> TestServerConfig {
+    TestServerConfig::new()
+}
+
+impl TestServerConfig {
+    /// Create default server configuration
+    pub(crate) fn new() -> TestServerConfig {
+        TestServerConfig {
+            tp: HttpVer::Both,
+            stream: StreamType::Tcp,
+            client_timeout: 5000,
+        }
+    }
+
+    /// Start http/1.1 server only
+    pub fn h1(mut self) -> Self {
+        self.tp = HttpVer::Http1;
+        self
+    }
+
+    /// Start http/2 server only
+    pub fn h2(mut self) -> Self {
+        self.tp = HttpVer::Http2;
+        self
+    }
+
+    /// Start openssl server
+    #[cfg(feature = "openssl")]
+    pub fn openssl(mut self, acceptor: open_ssl::ssl::SslAcceptor) -> Self {
+        self.stream = StreamType::Openssl(acceptor);
+        self
+    }
+
+    /// Start rustls server
+    #[cfg(feature = "rustls")]
+    pub fn rustls(mut self, config: rust_tls::ServerConfig) -> Self {
+        self.stream = StreamType::Rustls(config);
+        self
+    }
+
+    /// Set server client timeout in milliseconds for first request.
+    pub fn client_timeout(mut self, val: u64) -> Self {
+        self.client_timeout = val;
+        self
+    }
+}
+
+/// Get first available unused address
+pub fn unused_addr() -> net::SocketAddr {
+    let addr: net::SocketAddr = "127.0.0.1:0".parse().unwrap();
+    let socket = TcpBuilder::new_v4().unwrap();
+    socket.bind(&addr).unwrap();
+    socket.reuse_address(true).unwrap();
+    let tcp = socket.to_tcp_listener().unwrap();
+    tcp.local_addr().unwrap()
+}
+
+/// Test server controller
+pub struct TestServer {
+    addr: net::SocketAddr,
+    client: awc::Client,
+    system: actix_rt::System,
+    ssl: bool,
+    server: Server,
+}
+
+impl TestServer {
+    /// Construct test server url
+    pub fn addr(&self) -> net::SocketAddr {
+        self.addr
+    }
+
+    /// Construct test server url
+    pub fn url(&self, uri: &str) -> String {
+        let scheme = if self.ssl { "https" } else { "http" };
+
+        if uri.starts_with('/') {
+            format!("{}://localhost:{}{}", scheme, self.addr.port(), uri)
+        } else {
+            format!("{}://localhost:{}/{}", scheme, self.addr.port(), uri)
+        }
+    }
+
+    /// Create `GET` request
+    pub fn get<S: AsRef<str>>(&self, path: S) -> ClientRequest {
+        self.client.get(self.url(path.as_ref()).as_str())
+    }
+
+    /// Create `POST` request
+    pub fn post<S: AsRef<str>>(&self, path: S) -> ClientRequest {
+        self.client.post(self.url(path.as_ref()).as_str())
+    }
+
+    /// Create `HEAD` request
+    pub fn head<S: AsRef<str>>(&self, path: S) -> ClientRequest {
+        self.client.head(self.url(path.as_ref()).as_str())
+    }
+
+    /// Create `PUT` request
+    pub fn put<S: AsRef<str>>(&self, path: S) -> ClientRequest {
+        self.client.put(self.url(path.as_ref()).as_str())
+    }
+
+    /// Create `PATCH` request
+    pub fn patch<S: AsRef<str>>(&self, path: S) -> ClientRequest {
+        self.client.patch(self.url(path.as_ref()).as_str())
+    }
+
+    /// Create `DELETE` request
+    pub fn delete<S: AsRef<str>>(&self, path: S) -> ClientRequest {
+        self.client.delete(self.url(path.as_ref()).as_str())
+    }
+
+    /// Create `OPTIONS` request
+    pub fn options<S: AsRef<str>>(&self, path: S) -> ClientRequest {
+        self.client.options(self.url(path.as_ref()).as_str())
+    }
+
+    /// Connect to test http server
+    pub fn request<S: AsRef<str>>(&self, method: Method, path: S) -> ClientRequest {
+        self.client.request(method, path.as_ref())
+    }
+
+    pub async fn load_body<S>(
+        &mut self,
+        mut response: ClientResponse<S>,
+    ) -> Result<Bytes, PayloadError>
+    where
+        S: Stream<Item = Result<Bytes, PayloadError>> + Unpin + 'static,
+    {
+        response.body().limit(10_485_760).await
+    }
+
+    /// Connect to websocket server at a given path
+    pub async fn ws_at(
+        &mut self,
+        path: &str,
+    ) -> Result<Framed<impl AsyncRead + AsyncWrite, ws::Codec>, awc::error::WsClientError>
+    {
+        let url = self.url(path);
+        let connect = self.client.ws(url).connect();
+        connect.await.map(|(_, framed)| framed)
+    }
+
+    /// Connect to a websocket server
+    pub async fn ws(
+        &mut self,
+    ) -> Result<Framed<impl AsyncRead + AsyncWrite, ws::Codec>, awc::error::WsClientError>
+    {
+        self.ws_at("/").await
+    }
+
+    /// Gracefully stop http server
+    pub async fn stop(self) {
+        self.server.stop(true).await;
+        self.system.stop();
+        delay_for(time::Duration::from_millis(100)).await;
+    }
+}
+
+impl Drop for TestServer {
+    fn drop(&mut self) {
+        self.system.stop()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use actix_http::httpmessage::HttpMessage;
+    use futures::FutureExt;
     use serde::{Deserialize, Serialize};
     use std::time::SystemTime;
 
     use super::*;
-    use crate::{http::header, web, App, HttpResponse};
+    use crate::{http::header, web, App, HttpResponse, Responder};
 
     #[actix_rt::test]
     async fn test_basics() {
@@ -515,19 +968,24 @@ mod tests {
             .set(header::Date(SystemTime::now().into()))
             .param("test", "123")
             .data(10u32)
+            .app_data(20u64)
+            .peer_addr("127.0.0.1:8081".parse().unwrap())
             .to_http_request();
         assert!(req.headers().contains_key(header::CONTENT_TYPE));
         assert!(req.headers().contains_key(header::DATE));
+        assert_eq!(
+            req.head().peer_addr,
+            Some("127.0.0.1:8081".parse().unwrap())
+        );
         assert_eq!(&req.match_info()["test"], "123");
         assert_eq!(req.version(), Version::HTTP_2);
-        let data = req.get_app_data::<u32>().unwrap();
-        assert!(req.get_app_data::<u64>().is_none());
-        assert_eq!(*data, 10);
+        let data = req.app_data::<Data<u32>>().unwrap();
+        assert!(req.app_data::<Data<u64>>().is_none());
         assert_eq!(*data.get_ref(), 10);
 
-        assert!(req.app_data::<u64>().is_none());
-        let data = req.app_data::<u32>().unwrap();
-        assert_eq!(*data, 10);
+        assert!(req.app_data::<u32>().is_none());
+        let data = req.app_data::<u64>().unwrap();
+        assert_eq!(*data, 20);
     }
 
     #[actix_rt::test]
@@ -669,7 +1127,7 @@ mod tests {
         async fn async_with_block() -> Result<HttpResponse, Error> {
             let res = web::block(move || Some(4usize).ok_or("wrong")).await;
 
-            match res? {
+            match res {
                 Ok(value) => Ok(HttpResponse::Ok()
                     .content_type("text/plain")
                     .body(format!("Async with block value: {}", value))),
@@ -687,41 +1145,65 @@ mod tests {
         assert!(res.status().is_success());
     }
 
-    // #[actix_rt::test]
-    // fn test_actor() {
-    //     use actix::Actor;
+    #[actix_rt::test]
+    async fn test_server_data() {
+        async fn handler(data: web::Data<usize>) -> impl Responder {
+            assert_eq!(**data, 10);
+            HttpResponse::Ok()
+        }
 
-    //     struct MyActor;
+        let mut app = init_service(
+            App::new()
+                .data(10usize)
+                .service(web::resource("/index.html").to(handler)),
+        )
+        .await;
 
-    //     struct Num(usize);
-    //     impl actix::Message for Num {
-    //         type Result = usize;
-    //     }
-    //     impl actix::Actor for MyActor {
-    //         type Context = actix::Context<Self>;
-    //     }
-    //     impl actix::Handler<Num> for MyActor {
-    //         type Result = usize;
-    //         fn handle(&mut self, msg: Num, _: &mut Self::Context) -> Self::Result {
-    //             msg.0
-    //         }
-    //     }
+        let req = TestRequest::post().uri("/index.html").to_request();
+        let res = app.call(req).await.unwrap();
+        assert!(res.status().is_success());
+    }
 
-    //     let addr = run_on(|| MyActor.start());
-    //     let mut app = init_service(App::new().service(
-    //         web::resource("/index.html").to(move || {
-    //             addr.send(Num(1)).from_err().and_then(|res| {
-    //                 if res == 1 {
-    //                     HttpResponse::Ok()
-    //                 } else {
-    //                     HttpResponse::BadRequest()
-    //                 }
-    //             })
-    //         }),
-    //     ));
+    #[actix_rt::test]
+    async fn test_actor() {
+        use actix::Actor;
 
-    //     let req = TestRequest::post().uri("/index.html").to_request();
-    //     let res = block_fn(|| app.call(req)).unwrap();
-    //     assert!(res.status().is_success());
-    // }
+        struct MyActor;
+
+        struct Num(usize);
+        impl actix::Message for Num {
+            type Result = usize;
+        }
+        impl actix::Actor for MyActor {
+            type Context = actix::Context<Self>;
+        }
+        impl actix::Handler<Num> for MyActor {
+            type Result = usize;
+            fn handle(&mut self, msg: Num, _: &mut Self::Context) -> Self::Result {
+                msg.0
+            }
+        }
+
+        let addr = MyActor.start();
+
+        let mut app = init_service(App::new().service(web::resource("/index.html").to(
+            move || {
+                addr.send(Num(1)).map(|res| match res {
+                    Ok(res) => {
+                        if res == 1 {
+                            Ok(HttpResponse::Ok())
+                        } else {
+                            Ok(HttpResponse::BadRequest())
+                        }
+                    }
+                    Err(err) => Err(err),
+                })
+            },
+        )))
+        .await;
+
+        let req = TestRequest::post().uri("/index.html").to_request();
+        let res = app.call(req).await.unwrap();
+        assert!(res.status().is_success());
+    }
 }
